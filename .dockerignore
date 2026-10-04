@@ -1,0 +1,7 @@
+bin/
+*.exe
+.gocache/
+.gotmp/
+coverage.out
+data/
+music/

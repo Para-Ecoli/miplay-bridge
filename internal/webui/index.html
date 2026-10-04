@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>妙播桥 · 控制台</title>
+<style>
+  :root {
+    --bg: #0f141a;
+    --panel: #171e26;
+    --panel-2: #1d2632;
+    --line: #2a3644;
+    --text: #e8eef5;
+    --muted: #8fa1b3;
+    --accent: #4da3ff;
+    --ok: #3ddc84;
+    --warn: #ffb84d;
+    --err: #ff6b6b;
+    --busy: #b48cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.55 "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 22px 18px 60px; }
+  header.top { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; justify-content: space-between; }
+  h1 { font-size: 22px; margin: 0 0 2px; }
+  .sub { color: var(--muted); margin: 0; font-size: 13px; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 7px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 999px;
+    padding: 5px 12px; font-size: 13px; color: var(--muted);
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--warn); display: inline-block; }
+  .dot.ok { background: var(--ok); }
+  .dot.bad { background: var(--err); }
+
+  section.tokenbar {
+    margin: 16px 0; padding: 12px 14px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  }
+  section.tokenbar label { color: var(--muted); font-size: 13px; }
+  section.tokenbar input {
+    flex: 1 1 260px; min-width: 200px;
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-size: 14px;
+  }
+  .note { font-size: 13px; color: var(--warn); }
+  .note.err { color: var(--err); }
+  .hidden { display: none; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 14px; margin-top: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px; }
+  .card h2 { font-size: 15px; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  .card h2 .tag { font-size: 12px; font-weight: 400; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 1px 9px; }
+  .kv { display: grid; grid-template-columns: 96px 1fr; gap: 6px 10px; font-size: 14px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; word-break: break-all; }
+  .mono { font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 13px; }
+
+  .source-badge {
+    display: inline-block; font-size: 20px; font-weight: 600;
+    padding: 6px 16px; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--panel-2); margin-bottom: 10px;
+  }
+  .source-badge.miplay { border-color: var(--accent); color: var(--accent); }
+  .source-badge.dlna { border-color: var(--ok); color: var(--ok); }
+  .source-badge.api { border-color: var(--warn); color: var(--warn); }
+
+  .badge { display: inline-block; font-size: 12px; border-radius: 999px; padding: 2px 10px; border: 1px solid var(--line); color: var(--muted); vertical-align: middle; }
+  .badge.on { color: #0c1116; background: var(--ok); border-color: var(--ok); font-weight: 600; }
+  .badge.off { opacity: .75; }
+
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; align-items: center; }
+  .btn {
+    cursor: pointer; font-size: 14px; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px;
+    padding: 8px 14px; transition: border-color .15s, opacity .15s;
+  }
+  .btn:hover { border-color: var(--accent); }
+  .btn:disabled { opacity: .45; cursor: wait; }
+  .btn.primary { background: #1d3a5c; border-color: #2f5c8f; }
+  .btn.danger { border-color: #6b3040; background: #3a1e28; }
+  .btn.danger:hover { border-color: var(--err); }
+
+  .volume-row { display: flex; gap: 12px; align-items: center; margin-top: 4px; }
+  .volume-row input[type=range] { flex: 1; accent-color: var(--accent); }
+  .volume-num { min-width: 44px; text-align: right; font-weight: 600; }
+
+  #action-result {
+    margin-top: 16px; padding: 11px 14px; border-radius: 10px; font-size: 14px;
+    background: var(--panel); border: 1px solid var(--line); color: var(--muted);
+  }
+  #action-result.ok { border-color: #2b5c44; color: var(--ok); }
+  #action-result.err { border-color: #6b3040; color: var(--err); }
+
+  footer { margin-top: 26px; color: var(--muted); font-size: 12.5px; line-height: 1.8; }
+  footer code { background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 0 5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <h1>妙播桥</h1>
+      <p class="sub">本机声卡直出 · 小米妙播 + DLNA 双协议 · 单声卡独占仲裁</p>
+    </div>
+    <div class="chips">
+      <span class="chip"><span class="dot" id="dot-ready"></span><span id="text-ready">连接中…</span></span>
+      <span class="chip">版本 <span id="text-version">—</span></span>
+      <span class="chip">已运行 <span id="text-uptime">—</span></span>
+    </div>
+  </header>
+
+  <section class="tokenbar">
+    <label for="token-input">访问令牌</label>
+    <input id="token-input" type="password" placeholder="BRIDGE_TOKEN 未设置时留空即可" autocomplete="off">
+    <button id="btn-token" class="btn">保存令牌</button>
+    <span id="auth-note" class="note hidden"></span>
+  </section>
+
+  <div class="grid">
+    <div class="card">
+      <h2>当前音源 <span class="tag">声卡占用</span></h2>
+      <div class="source-badge" id="active-source">—</div>
+      <dl class="kv">
+        <dt>播放状态</dt><dd id="play-state">—</dd>
+        <dt>曲目</dt><dd id="play-title">—</dd>
+        <dt>进度</dt><dd id="play-progress">—</dd>
+      </dl>
+    </div>
+
+    <div class="card">
+      <h2>小米妙播 <span class="tag" id="miplay-advertising">—</span></h2>
+      <dl class="kv">
+        <dt>连接</dt><dd id="miplay-connected">—</dd>
+        <dt>来源设备</dt><dd id="miplay-source">—</dd>
+        <dt>实时音量</dt><dd id="miplay-volume">—</dd>
+        <dt>播放状态</dt><dd id="miplay-state">—</dd>
+        <dt>媒体信息</dt><dd id="miplay-media">—</dd>
+      </dl>
+      <div class="actions">
+        <button id="btn-miplay" class="btn primary">清除妙播连接</button>
+        <span class="badge off" id="badge-miplay">未连接</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>DLNA 渲染器 <span class="tag">MediaRenderer</span></h2>
+      <dl class="kv">
+        <dt>友好名称</dt><dd id="dlna-name">—</dd>
+        <dt>设备 UDN</dt><dd class="mono" id="dlna-udn">—</dd>
+        <dt>订阅者</dt><dd id="dlna-subs">—</dd>
+        <dt>传输状态</dt><dd id="dlna-transport">—</dd>
+        <dt>当前曲目</dt><dd id="dlna-track">—</dd>
+      </dl>
+      <div class="actions">
+        <button id="btn-dlna" class="btn primary">清除 DLNA 连接</button>
+        <span class="badge off" id="badge-dlna">未播放</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>声卡 <span class="tag" id="card-hardware">—</span></h2>
+      <dl class="kv">
+        <dt>设备可见</dt><dd id="card-present">—</dd>
+        <dt>卡列表</dt><dd id="card-list">—</dd>
+        <dt>Auto-Mute</dt><dd id="card-automute">—</dd>
+        <dt>混音器</dt><dd id="card-mixer">—</dd>
+      </dl>
+      <div class="actions">
+        <button id="btn-test" class="btn">测试声卡（播放测试音）</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>播放内核 <span class="tag">MPD</span></h2>
+      <dl class="kv">
+        <dt>运行状态</dt><dd id="mpd-running">—</dd>
+        <dt>进程号</dt><dd id="mpd-pid">—</dd>
+        <dt>重启次数</dt><dd id="mpd-restarts">—</dd>
+        <dt>最近错误</dt><dd id="mpd-error">—</dd>
+      </dl>
+    </div>
+
+    <div class="card">
+      <h2>音量与总控 <span class="tag">硬件混音器</span></h2>
+      <div class="volume-row">
+        <input type="range" id="volume-slider" min="0" max="100" step="1" value="80">
+        <span class="volume-num" id="volume-label">—</span>
+      </div>
+      <div class="actions">
+        <button id="btn-volume" class="btn">应用音量</button>
+        <button id="btn-mute" class="btn">静音</button>
+        <button id="btn-stop-all" class="btn danger">全部停止</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="action-result">等待操作…</div>
+
+  <footer>
+    本页每 2 秒轮询 <code>/api/status</code>；所有数据操作均以 <code>x-bridge-token</code> 头鉴权（在容器环境变量 <code>BRIDGE_TOKEN</code> 中设置，未设置则局域网内免鉴权）。
+    「清除妙播连接」结束手机投送并释放声卡；「清除 DLNA 连接」停止播放、清空队列并结束全部事件订阅；「测试声卡」经播放内核走生产同路径播放 440 Hz 测试音。
+  </footer>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var token = localStorage.getItem("miplay-bridge-token") || "";
+  var muted = false;
+  var busy = false;
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  function setText(id, value) {
+    var node = $(id);
+    if (node) { node.textContent = (value === undefined || value === null || value === "") ? "—" : String(value); }
+  }
+
+  function headers() {
+    var h = { "Content-Type": "application/json" };
+    if (token) { h["x-bridge-token"] = token; }
+    return h;
+  }
+
+  function api(path, options) {
+    var opts = options || {};
+    opts.headers = headers();
+    return fetch(path, opts).then(function (response) {
+      return response.json().catch(function () { return null; }).then(function (payload) {
+        return { ok: response.ok, status: response.status, payload: payload };
+      });
+    });
+  }
+
+  function flash(message, kind) {
+    var node = $("action-result");
+    node.textContent = message;
+    node.className = kind || "";
+  }
+
+  function fmtUptime(seconds) {
+    if (seconds === undefined || seconds === null) { return "—"; }
+    seconds = Math.max(0, Math.floor(seconds));
+    var h = Math.floor(seconds / 3600);
+    var m = Math.floor((seconds % 3600) / 60);
+    var s = seconds % 60;
+    if (h > 0) { return h + " 时 " + m + " 分"; }
+    if (m > 0) { return m + " 分 " + s + " 秒"; }
+    return s + " 秒";
+  }
+
+  function fmtTime(value) {
+    if (!value || value <= 0) { return "0:00"; }
+    var total = Math.floor(value);
+    var m = Math.floor(total / 60);
+    var s = total % 60;
+    return m + ":" + (s < 10 ? "0" : "") + s;
+  }
+
+  function sourceLabel(source) {
+    switch (source) {
+      case "miplay": return "小米妙播";
+      case "dlna": return "DLNA 投送";
+      case "api": return "插件 API";
+      default: return "空闲";
+    }
+  }
+
+  function stateLabel(state) {
+    switch (state) {
+      case "play": return "播放中";
+      case "pause": return "已暂停";
+      case "stop": return "已停止";
+      case "streaming": return "实时串流中";
+      case "connected": return "已连接";
+      case "paused": return "已暂停";
+      case "idle": return "空闲";
+      default: return state || "未知";
+    }
+  }
+
+  function render(payload) {
+    if (!payload) { return; }
+    setText("text-version", payload.version);
+    setText("text-uptime", fmtUptime(payload.uptime_seconds));
+
+    var mpd = payload.mpd || {};
+    var mixer = payload.mixer || {};
+    var ready = !!(mpd.running && mixer.initialized);
+    $("dot-ready").className = "dot " + (ready ? "ok" : "bad");
+    setText("text-ready", ready ? "服务正常" : "服务降级");
+
+    var source = payload.active_source || "idle";
+    var badge = $("active-source");
+    badge.textContent = sourceLabel(source);
+    badge.className = "source-badge" + (source === "idle" ? "" : " " + source);
+
+    var playback = payload.playback || {};
+    setText("play-state", stateLabel(playback.state));
+    setText("play-title", playback.title ? (playback.title + (playback.artist ? " — " + playback.artist : "")) : "");
+    setText("play-progress", fmtTime(playback.elapsed) + " / " + fmtTime(playback.duration));
+
+    var miplay = payload.miplay || {};
+    setText("miplay-advertising", miplay.enabled === false ? "已禁用" : (miplay.advertising ? "广播中" : "未广播"));
+    setText("miplay-connected", miplay.enabled === false ? "已禁用" : (miplay.connected ? "已连接" : "未连接"));
+    setText("miplay-source", miplay.source_name);
+    setText("miplay-volume", miplay.connected ? (miplay.volume + " %") : "");
+    setText("miplay-state", miplay.enabled === false ? "" : stateLabel(miplay.state));
+    var media = miplay.media_info || {};
+    var mediaText = "";
+    if (media.title || media.artist) {
+      mediaText = (media.title || "") + (media.artist ? " — " + media.artist : "");
+    }
+    setText("miplay-media", mediaText);
+    var miplayBadge = $("badge-miplay");
+    if (miplay.connected) {
+      miplayBadge.textContent = "占用中" + (miplay.paused ? "（暂停）" : "");
+      miplayBadge.className = "badge on";
+    } else {
+      miplayBadge.textContent = "未连接";
+      miplayBadge.className = "badge off";
+    }
+
+    var dlna = payload.dlna || {};
+    setText("dlna-name", dlna.enabled === false ? "已禁用" : dlna.friendly_name);
+    var udn = dlna.udn || "";
+    setText("dlna-udn", udn.length > 22 ? udn.slice(0, 22) + "…" : udn);
+    setText("dlna-subs", dlna.enabled === false ? "" : (dlna.subscribers + " 个"));
+    setText("dlna-transport", dlna.enabled === false ? "" : stateLabel(dlna.transport_state));
+    setText("dlna-track", dlna.title ? (dlna.title + (dlna.artist ? " — " + dlna.artist : "")) : "");
+    var dlnaBadge = $("badge-dlna");
+    var dlnaActive = dlna.transport_state === "PLAYING" || dlna.transport_state === "PAUSED_PLAYBACK";
+    if (dlnaActive) {
+      dlnaBadge.textContent = "占用中";
+      dlnaBadge.className = "badge on";
+    } else {
+      dlnaBadge.textContent = "未播放";
+      dlnaBadge.className = "badge off";
+    }
+
+    var card = payload.sound_card || {};
+    setText("card-hardware", card.hardware_device);
+    setText("card-present", card.present ? "是" : "否");
+    var cards = card.cards || [];
+    setText("card-list", cards.length ? cards.map(function (c) { return "card " + c.index + " (" + (c.id || c.name || "?") + ")"; }).join("，") : "");
+    setText("card-automute", card.auto_mute_fixed || payload.auto_mute_fixed ? "已修复（已禁用）" : "未修复");
+    setText("card-mixer", mixer.initialized ? ("已初始化 · " + (mixer.volume_percent !== undefined ? mixer.volume_percent + " %" : "") + (mixer.muted ? "（静音）" : "")) : "未初始化");
+
+    setText("mpd-running", mpd.running ? "运行中" : "未运行");
+    setText("mpd-pid", mpd.pid);
+    setText("mpd-restarts", mpd.restarts);
+    setText("mpd-error", mpd.last_error);
+
+    muted = !!mixer.muted;
+    $("btn-mute").textContent = muted ? "取消静音" : "静音";
+    var slider = $("volume-slider");
+    if (!slider.dataset.dragging && mixer.volume_percent !== undefined) {
+      slider.value = mixer.volume_percent;
+    }
+    setText("volume-label", (slider.value) + " %");
+  }
+
+  function poll() {
+    api("/api/status").then(function (result) {
+      if (result.status === 401) {
+        var note = $("auth-note");
+        note.textContent = "令牌无效或缺失：请在下方输入 BRIDGE_TOKEN 后保存。";
+        note.className = "note err";
+        $("text-ready").textContent = "需要令牌";
+        $("dot-ready").className = "dot bad";
+        return;
+      }
+      $("auth-note").className = "note hidden";
+      if (!result.ok || !result.payload) {
+        $("text-ready").textContent = "无法连接";
+        $("dot-ready").className = "dot bad";
+        return;
+      }
+      render(result.payload);
+    }).catch(function () {
+      $("text-ready").textContent = "无法连接";
+      $("dot-ready").className = "dot bad";
+    });
+  }
+
+  function withBusy(button, promise) {
+    if (busy) { return; }
+    busy = true;
+    button.disabled = true;
+    promise.then(function (message) {
+      flash(message, "ok");
+    }).catch(function (error) {
+      flash(error.message, "err");
+    }).finally(function () {
+      busy = false;
+      button.disabled = false;
+      poll();
+    });
+  }
+
+  function post(path, body) {
+    return api(path, { method: "POST", body: JSON.stringify(body || {}) }).then(function (result) {
+      if (!result.ok) {
+        var message = (result.payload && result.payload.error) ? result.payload.error : ("HTTP " + result.status);
+        if (result.status === 401) { message = "令牌无效或缺失，请先保存令牌。"; }
+        throw new Error(message);
+      }
+      return result.payload || {};
+    });
+  }
+
+  $("btn-token").addEventListener("click", function () {
+    token = $("token-input").value.trim();
+    localStorage.setItem("miplay-bridge-token", token);
+    flash("令牌已保存到本机浏览器。", "ok");
+    poll();
+  });
+
+  $("btn-miplay").addEventListener("click", function () {
+    var button = this;
+    withBusy(button, post("/api/miplay/disconnect").then(function (payload) {
+      return payload.was_connected ? "妙播连接已清除（此前有活跃投送，声卡已释放）。" : "妙播当前没有活跃连接，无需清除。";
+    }));
+  });
+
+  $("btn-dlna").addEventListener("click", function () {
+    var button = this;
+    withBusy(button, post("/api/dlna/disconnect").then(function (payload) {
+      return payload.was_active ? "DLNA 连接已清除（播放已停止，队列与订阅已释放）。" : "DLNA 当前没有活跃播放，已复位为空闲状态。";
+    }));
+  });
+
+  $("btn-test").addEventListener("click", function () {
+    var button = this;
+    withBusy(button, post("/api/test-play").then(function (payload) {
+      return "测试音已发送：" + (payload.frequency_hz || 440) + " Hz，" + (payload.seconds || 2) + " 秒，请留意扬声器。";
+    }));
+  });
+
+  $("btn-stop-all").addEventListener("click", function () {
+    var button = this;
+    withBusy(button, post("/api/control", { action: "stop_all" }).then(function () {
+      return "已全部停止：妙播投送、DLNA 播放与播放内核均已终止，声卡已释放。";
+    }));
+  });
+
+  $("btn-volume").addEventListener("click", function () {
+    var button = this;
+    var value = parseInt($("volume-slider").value, 10);
+    withBusy(button, post("/api/volume", { volume: value }).then(function () {
+      return "音量已设置为 " + value + " %（硬件混音器）。";
+    }));
+  });
+
+  $("btn-mute").addEventListener("click", function () {
+    var button = this;
+    var desired = !muted;
+    withBusy(button, post("/api/volume", { mute: desired }).then(function () {
+      return desired ? "已静音（硬件静音开关）。" : "已取消静音。";
+    }));
+  });
+
+  var slider = $("volume-slider");
+  slider.addEventListener("input", function () {
+    slider.dataset.dragging = "1";
+    setText("volume-label", slider.value + " %");
+  });
+  slider.addEventListener("change", function () {
+    delete slider.dataset.dragging;
+  });
+
+  $("token-input").value = token;
+  poll();
+  setInterval(poll, 2000);
+})();
+</script>
+</body>
+</html>
