@@ -2,9 +2,11 @@ package miplay
 
 import (
 	"crypto/hmac"
-	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -64,16 +66,25 @@ type TraceEntry struct {
 type LegacyReceiverSession struct {
 	mu sync.Mutex
 
+	// onWarn is an optional diagnostic sink (set by the receiver). Kept as a plain
+	// func so this package stays free of logging dependencies.
+	onWarn func(string)
+
 	challenge         []byte
 	challengeSequence uint16
 	friendlyName      string
 	volume            int
 
-	phase             ControlPhase
-	authenticated     bool
-	sourceVersion     string
-	sourceName        string
-	mediaInfo         map[string]string
+	phase           ControlPhase
+	authenticated   bool
+	sourceVersion   string
+	sourceName      string
+	mediaInfo       map[string]string
+	durationSeconds float64 // 手机上报的曲目时长（秒）；0 = 未知
+	coverURL        string  // 手机上报的封面 URL；"" = 无
+	// trackVersion 是曲目身份代次：标题一变就 +1。接收端据此把「本次投送的
+	// 已播放时长」归零，否则同一次投送里换歌会继承上一首的进度。
+	trackVersion      int
 	setPlaySourceSeen bool
 	mediaStarted      bool
 	notificationSeq   uint16
@@ -150,6 +161,29 @@ func (s *LegacyReceiverSession) MediaInfo() map[string]string {
 		snapshot[key] = value
 	}
 	return snapshot
+}
+
+// DurationSeconds reports the track length the source announced, or 0 when the
+// source never sent one.
+func (s *LegacyReceiverSession) DurationSeconds() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.durationSeconds
+}
+
+// CoverURL reports the cover-art URL the source announced, or "".
+func (s *LegacyReceiverSession) CoverURL() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.coverURL
+}
+
+// TrackVersion changes whenever the reported track identity changes, so the
+// receiver can restart its elapsed clock for the next song.
+func (s *LegacyReceiverSession) TrackVersion() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.trackVersion
 }
 
 // Volume reports the current protocol volume.
@@ -392,11 +426,18 @@ func (s *LegacyReceiverSession) processBusiness(frame CommandFrame) (ControlResu
 		return s.ack(CmdGetDeviceInfoAck, frame.Sequence, payload), nil
 
 	case CmdSetLocalDeviceInfo:
-		var payload map[string]any
-		if err := json.Unmarshal(frame.Payload, &payload); err != nil {
-			return s.stop("setLocalDeviceInfo payload is not JSON")
+		// 10-04 实测：这条命令的载荷是**明文 JSON**（0x0058 的 hex_head 直接是
+		// {"sourceName":"R…），只有 SET_VOLUME 那类才包 SafetyData 信封。
+		// 上游原本的 json.Unmarshal 是对的——曾经在这里多套了一层 Safety 解密，
+		// 反而把明文当成密文解不开、白白丢掉全部元数据。
+		var info map[string]any
+		if err := json.Unmarshal(frame.Payload, &info); err != nil {
+			// Malformed metadata must not kill a working cast.
+			s.loggerWarn(fmt.Sprintf("setLocalDeviceInfo payload is not JSON (%d bytes hex_head=%s); ignoring metadata",
+				len(frame.Payload), hex.EncodeToString(truncateBytes(frame.Payload, 16))))
+			return s.ack(CmdSetLocalDeviceInfoAck, frame.Sequence, nil), nil
 		}
-		if sourceName, ok := payload["sourceName"].(string); ok && sourceName != "" {
+		if sourceName, ok := info["sourceName"].(string); ok && sourceName != "" {
 			if len(sourceName) > 120 {
 				sourceName = sourceName[:120]
 			}
@@ -413,21 +454,46 @@ func (s *LegacyReceiverSession) processBusiness(frame CommandFrame) (ControlResu
 		return s.emptyQueryAck(frame, CmdGetMirrorModeAck, EncodeScalar(2))
 
 	case CmdGetVolume:
-		return s.emptyQueryAck(frame, CmdGetVolumeAck, EncodeScalar(uint32(s.volume)))
+		// 音量查询的上行载荷不参与业务（响应由我们下行）；不因载荷形态（可能是
+		// SafetyData 信封）而掐会话——与 SET_VOLUME 同一口径。
+		return s.ack(CmdGetVolumeAck, frame.Sequence, EncodeScalar(uint32(s.volume))), nil
 
 	case CmdSetVolume:
-		if len(frame.Payload) != 4 {
-			return s.stop("setVolume payload must be a four-byte integer")
+		// MIUI 会把业务命令也放进 SafetyData（AES-128-CBC 状态化信封）。10-04 真机实测
+		// 该命令 25 字节：00 07 01 e0 0c | 4 字节 CRC | 16 字节密文，字段与作者自己的
+		// safetyCipher 头完全吻合（headerLength=7 / version=1 / flags=0xE0 / padding=12）。
+		// 原实现只认 4 字节明文，于是每条音量命令都被判协议违规并 stop，手机侧表现为
+		// 音量条拖动无响应。
+		//
+		// 注意：解密失败绝不能 stop()。上一版把错误处理写成 stop()，结果每次调音量就
+		// 断开会话、手机反复重连（主人看到的「一调音量就崩溃」）。IV 状态尚未锁定时
+		// 解不开是暂时的，忽略这条命令、等后续命令重新对齐状态即可。
+		if len(frame.Payload) == 4 {
+			// 明文形态（无 Safety 通道的老固件）
+			if volume, ok := decodeScalarVolume(frame.Payload); ok {
+				s.volume = volume
+				result := s.ack(CmdSetVolumeAck, frame.Sequence, nil)
+				result.VolumeSet = true
+				result.Volume = volume
+				return result, nil
+			}
 		}
-		volume := int(binary.BigEndian.Uint32(frame.Payload))
-		if volume < 0 || volume > 100 {
-			return s.stop("volume out of range")
+		if s.safety != nil {
+			if volume, ok := s.decryptVolume(frame.Payload); ok {
+				s.volume = volume
+				result := s.ack(CmdSetVolumeAck, frame.Sequence, nil)
+				result.VolumeSet = true
+				result.Volume = volume
+				return result, nil
+			}
+			diag := s.safety.Diagnostics()
+			s.loggerWarn(fmt.Sprintf("setVolume safety decrypt unavailable (phase=%q mutual_auth=%v in_iv=%q in_key=%q payload=%d); ignoring command",
+				diag.Phase, diag.MutualAuthComplete, diag.InboundIVMode, diag.AuthKeyMode, len(frame.Payload)))
+			// 仍然回 ACK：让手机知道 NAS 在线，不要重连风暴。音量维持上一值。
+			return s.ack(CmdSetVolumeAck, frame.Sequence, nil), nil
 		}
-		s.volume = volume
-		result := s.ack(CmdSetVolumeAck, frame.Sequence, nil)
-		result.VolumeSet = true
-		result.Volume = volume
-		return result, nil
+		s.loggerWarn(fmt.Sprintf("setVolume arrived without a Safety channel (payload=%d bytes); ignoring command", len(frame.Payload)))
+		return s.ack(CmdSetVolumeAck, frame.Sequence, nil), nil
 
 	case CmdGetState:
 		state := uint32(3)
@@ -448,6 +514,8 @@ func (s *LegacyReceiverSession) processBusiness(frame CommandFrame) (ControlResu
 		return s.emptyQueryAck(frame, CmdGetPositionAck, EncodeScalar(0))
 
 	case CmdSetPlaySource:
+		// 保持严格：这条命令是 OPEN 握手的前置状态，解析不了就无法确认播放源已就绪
+		// （与 setLocalDeviceInfo / setMediaInfo 那类装饰性元数据不同，不适用容忍式）。
 		var payload map[string]any
 		if err := json.Unmarshal(frame.Payload, &payload); err != nil {
 			return s.stop("setPlaySource payload is not JSON")
@@ -467,9 +535,12 @@ func (s *LegacyReceiverSession) processBusiness(frame CommandFrame) (ControlResu
 		return ControlResult{Accepted: true, Reason: "WFD source endpoint accepted", OpenRequest: &request}, nil
 
 	case CmdSetMediaInfo:
+		// 同 setLocalDeviceInfo：元数据出错不得掐会话（载荷形态随手机版本变化）。
 		var payload map[string]any
 		if err := json.Unmarshal(frame.Payload, &payload); err != nil {
-			return s.stop("setMediaInfo payload is not JSON")
+			s.loggerWarn(fmt.Sprintf("setMediaInfo payload is not JSON (%d bytes hex_head=%s); ignoring metadata",
+				len(frame.Payload), hex.EncodeToString(truncateBytes(frame.Payload, 16))))
+			return s.ack(CmdSetMediaInfoAck, frame.Sequence, nil), nil
 		}
 		s.captureMediaInfo(payload)
 		return s.ack(CmdSetMediaInfoAck, frame.Sequence, nil), nil
@@ -503,16 +574,87 @@ func (s *LegacyReceiverSession) captureMediaInfo(payload map[string]any) {
 		}
 	}
 	for _, source := range sources {
+		// 10-05 真机取证：MIUI 发的是 mTitle/mArtist/mAlbum（带 m 前缀），
+		// 上游只认 title/artist/album，所以歌名一直收得到却解析不出来。
+		// 两种拼写都试，老版本客户端可能不带前缀。
 		for _, key := range []string{"title", "artist", "album"} {
-			value, ok := source[key].(string)
-			if !ok || value == "" {
+			value := ""
+			for _, field := range []string{"m" + strings.ToUpper(key[:1]) + key[1:], key} {
+				if v, ok := source[field].(string); ok && v != "" {
+					value = v
+					break
+				}
+			}
+			if value == "" {
 				continue
 			}
-			if _, done := s.mediaInfo[key]; !done {
-				s.mediaInfo[key] = truncateForLog(value, 120)
+			// 逐字段更新（新值非空才覆盖）：同一次投送里手机会换歌，只在首次
+			// 写入会让控制台永远停播第一首的歌名。标题一变即视为新曲目。
+			value = truncateForLog(value, 120)
+			if s.mediaInfo[key] == value {
+				continue
+			}
+			s.mediaInfo[key] = value
+			if key == "title" {
+				s.trackVersion++
+				// 新曲目的时长/封面必须一起作废，否则这一首没带元数据时会
+				// 沿用上一首的长度，进度条直接失真。
+				s.durationSeconds = 0
+				s.coverURL = ""
 			}
 		}
 	}
+	// 第二遍专门取时长与封面：它们同样带 m 前缀（真机实测 mDuration=270800ms、
+	// mCoverUrl 存在），但不进 mediaInfo —— 那是给歌名用的字符串表。单独一遍
+	// 是为了避免「时长先于标题读到」时被上面的新曲目重置清掉。
+	for _, source := range sources {
+		if s.durationSeconds == 0 {
+			for _, field := range []string{"mDuration", "durationMs", "duration_ms"} {
+				if seconds, ok := mediaDurationSeconds(source[field]); ok {
+					s.durationSeconds = seconds
+					break
+				}
+			}
+		}
+		if s.coverURL == "" {
+			for _, field := range []string{"mCoverUrl", "coverUrl", "cover_url"} {
+				value, ok := source[field].(string)
+				if !ok {
+					continue
+				}
+				if trimmed := strings.TrimSpace(value); trimmed != "" {
+					s.coverURL = truncateForLog(trimmed, 512)
+					break
+				}
+			}
+		}
+	}
+}
+
+// mediaDurationSeconds normalises the source-reported track length.
+//
+// Measured on the target phone: mDuration is milliseconds (270800 -> 4m31s), so
+// that is the only unit accepted. The value must also land inside a plausible
+// window; anything else yields ok=false and the console says "duration unknown"
+// instead of drawing a progress bar from a bogus number.
+func mediaDurationSeconds(value any) (float64, bool) {
+	var milliseconds float64
+	switch typed := value.(type) {
+	case float64:
+		milliseconds = typed
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(typed), 64)
+		if err != nil {
+			return 0, false
+		}
+		milliseconds = parsed
+	default:
+		return 0, false
+	}
+	if milliseconds < 1000 || milliseconds > 24*60*60*1000 {
+		return 0, false
+	}
+	return milliseconds / 1000, true
 }
 
 func (s *LegacyReceiverSession) emptyQueryAck(frame CommandFrame, command Command, payload []byte) (ControlResult, error) {

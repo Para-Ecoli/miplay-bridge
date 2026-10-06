@@ -2,11 +2,15 @@ package miplay
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miplay-bridge/miplay-bridge/internal/config"
@@ -25,19 +29,41 @@ const controlIdleTimeout = 60 * time.Second
 
 // Hooks connect the receiver to the sound-card arbitration engine.
 type Hooks struct {
-	// Claim reserves the realtime output slot. Returning ErrDeviceBusy is
-	// surfaced to the phone as a failed cast attempt.
-	Claim func() error
-	// Release frees the realtime output slot. Must be idempotent.
-	Release func()
+	// Claim asks the arbitration engine for the exclusive realtime output slot.
+	// Returning ErrDeviceBusy surfaces to the phone as a failed cast attempt.
+	//
+	// req.Evict is how the engine preempts this sender later, when a newer
+	// sender wants the card: it must tear this cast down and return only once
+	// the ALSA device is genuinely free. req.Peer identifies the sender so a
+	// re-claim by the same phone never evicts itself.
+	Claim func(ctx context.Context, req ClaimRequest) error
+	// Release frees the realtime output slot for the given session. Must be
+	// idempotent, and must not free a slot now held by a different session.
+	Release func(peer, token string)
 	// SetVolume mirrors the phone's SET_VOLUME onto the hardware mixer.
 	SetVolume func(percent int)
+}
+
+// ClaimRequest carries the identity of one cast attempt plus the teardown the
+// engine needs to preempt it.
+type ClaimRequest struct {
+	// Peer is the casting phone. A reconnect from the same peer is not a
+	// newcomer and must not evict the session it is replacing.
+	Peer string
+	// Token identifies this session instance, so a superseded session unwinding
+	// late cannot free the slot its successor holds.
+	Token string
+	// Evict stops this cast and returns only after the output device is free.
+	Evict func(ctx context.Context) error
 }
 
 // SessionSummary is the post-mortem of the most recent control session, kept
 // for /api/status and FAQ debugging.
 type SessionSummary struct {
-	Peer          string             `json:"peer"`
+	Peer string `json:"peer"`
+	// Volume 是本会话最后生效的协议音量。会话结束后 Status 仍回落到
+	// cfg.DefaultVolume，手机重开时会看到「音量被重置」——记住它才能延续。
+	Volume        int                `json:"volume"`
 	StartedAt     time.Time          `json:"started_at"`
 	EndedAt       time.Time          `json:"ended_at"`
 	Authenticated bool               `json:"authenticated"`
@@ -53,24 +79,45 @@ type SessionSummary struct {
 
 // Status is the MiPlay slice of /api/status.
 type Status struct {
-	Enabled        bool               `json:"enabled"`
-	Advertising    bool               `json:"advertising"`
-	ListenPort     int                `json:"listen_port"`
-	DeviceID       string             `json:"device_id"`
-	Connected      bool               `json:"connected"`
-	ConnectedSince time.Time          `json:"connected_since,omitempty"`
-	Peer           string             `json:"peer,omitempty"`
-	SourceName     string             `json:"source_name,omitempty"`
-	MediaInfo      map[string]string  `json:"media_info,omitempty"`
-	Volume         int                `json:"volume"`
-	State          string             `json:"state"`
-	Paused         bool               `json:"paused,omitempty"`
-	MediaFrames    int64              `json:"media_frames"`
-	MediaBytes     int64              `json:"media_bytes"`
-	Safety         *SafetyDiagnostics `json:"safety,omitempty"`
-	Pipeline       PipelineStats      `json:"pipeline"`
-	LastSession    *SessionSummary    `json:"last_session,omitempty"`
+	Enabled        bool              `json:"enabled"`
+	Advertising    bool              `json:"advertising"`
+	ListenPort     int               `json:"listen_port"`
+	DeviceID       string            `json:"device_id"`
+	Connected      bool              `json:"connected"`
+	ConnectedSince time.Time         `json:"connected_since,omitempty"`
+	Peer           string            `json:"peer,omitempty"`
+	SourceName     string            `json:"source_name,omitempty"`
+	MediaInfo      map[string]string `json:"media_info,omitempty"`
+	// DurationSeconds / CoverURL / Position feed the console's "now playing"
+	// strip. They come from the phone's metadata, except PositionSeconds, which
+	// is a LOCAL estimate — see PositionSource. The protocol lets the phone ask
+	// the receiver for a position (0x0010 inbound), never the other way round,
+	// so the bridge has no way to read a real playhead out of a MiPlay cast.
+	DurationSeconds float64            `json:"duration_seconds,omitempty"`
+	CoverURL        string             `json:"cover_url,omitempty"`
+	PositionSeconds float64            `json:"position_seconds"`
+	PositionSource  string             `json:"position_source"`
+	Volume          int                `json:"volume"`
+	State           string             `json:"state"`
+	Paused          bool               `json:"paused,omitempty"`
+	MediaFrames     int64              `json:"media_frames"`
+	MediaBytes      int64              `json:"media_bytes"`
+	Safety          *SafetyDiagnostics `json:"safety,omitempty"`
+	Pipeline        PipelineStats      `json:"pipeline"`
+	LastSession     *SessionSummary    `json:"last_session,omitempty"`
 }
+
+// PositionSource values reported by Status.PositionSource.
+const (
+	// PositionSourceNone means the bridge has no playhead to show.
+	PositionSourceNone = "none"
+	// PositionSourceLocalEstimate means the playhead is a local clock started
+	// from the first media frame — it is NOT a value the phone reported. The
+	// protocol only lets the phone query the receiver for a position, so a
+	// MiPlay cast has no readable playhead; the console labels this estimate
+	// rather than passing it off as measured.
+	PositionSourceLocalEstimate = "local_estimate"
+)
 
 // Receiver is the assembled MiPlay receiver.
 type Receiver struct {
@@ -81,12 +128,25 @@ type Receiver struct {
 	pipeline  *Pipeline
 	responder *Responder
 
-	mu          sync.Mutex
+	mu sync.Mutex
+	// claimMu serialises cast claims so two phones racing for the exclusive
+	// output device cannot both believe they won.
+	claimMu     sync.Mutex
 	listener    net.Listener
 	active      *sessionRuntime
 	lastSession *SessionSummary
+	lastVolume  int // 最近一次生效的协议音量（-1 = 尚未记录），供会话结束后回显
 	startedAt   time.Time
 	closed      bool
+}
+
+// sessionSeq hands out the per-session tokens. A token must be unique per
+// session instance, not just per peer: the same phone reconnecting produces a
+// new session that has to be distinguishable from the one it replaces.
+var sessionSeq atomic.Uint64
+
+func nextSessionToken(peer string) string {
+	return fmt.Sprintf("%s#%d", peer, sessionSeq.Add(1))
 }
 
 // sessionRuntime tracks the single active control session. All mutable
@@ -97,12 +157,28 @@ type sessionRuntime struct {
 
 	peer      string
 	startedAt time.Time
-	session   *LegacyReceiverSession
-	conn      net.Conn
-	claimed   bool
+	// token identifies this session instance (not just the peer). It is the
+	// pipeline ownership key, so a superseded session can neither stop nor
+	// adopt the pipeline that replaced it.
+	token   string
+	session *LegacyReceiverSession
+	conn    net.Conn
+	claimed bool
+	// retired is set the moment this session enters teardown. Its read loop can
+	// still be parked on a frame, and that frame must not restart the pipeline
+	// (see ensurePipeline): a pipeline nobody feeds holds the exclusive device
+	// open and silences every later cast.
+	retired atomic.Bool
 
 	cancelWFD context.CancelFunc
 	paused    bool
+	// Playhead bookkeeping for the console. mediaStartedAt is set from the
+	// first media frame; the pause ledger freezes it while the phone says it is
+	// paused; trackVersion restarts it when the phone moves to the next song.
+	mediaStartedAt time.Time
+	pausedAt       time.Time
+	pausedTotal    time.Duration
+	trackVersion   int
 
 	controlFrames int
 	rtspReady     bool
@@ -127,6 +203,7 @@ func NewReceiver(cfg config.Config, logger *slog.Logger, hooks Hooks) *Receiver 
 			ControlPort:  cfg.MiPlayControlPort,
 			DeviceIDFile: cfg.MiPlayDeviceIDFile(),
 		}, logger),
+		lastVolume: -1,
 	}
 }
 
@@ -206,7 +283,12 @@ func (r *Receiver) acceptLoop(ctx context.Context) {
 func (r *Receiver) handleControl(ctx context.Context, connection net.Conn) {
 	peerHost, peerPort := endpointOf(connection.RemoteAddr())
 	localHost, localPort := endpointOf(connection.LocalAddr())
-	report := &sessionRuntime{peer: peerHost, startedAt: time.Now().UTC()}
+	report := &sessionRuntime{
+		peer:         peerHost,
+		startedAt:    time.Now().UTC(),
+		trackVersion: -1,
+		token:        nextSessionToken(peerHost),
+	}
 	r.logger.Info("miplay control connection accepted", "peer", peerHost, "local_port", localPort)
 
 	challenge, err := GenerateLegacyChallenge()
@@ -215,8 +297,14 @@ func (r *Receiver) handleControl(ctx context.Context, connection net.Conn) {
 		connection.Close()
 		return
 	}
-	session, err := NewLegacyReceiverSession(challenge, 0, r.cfg.MiPlayName, r.cfg.DefaultVolume,
+	// 新会话的初始音量取「上次生效值」而不是启动默认值：手机在会话建立后会先
+	// GetVolume 查询，用启动默认值（100）应答会让它的滑块每次都跳回满格。
+	sessionVolume := r.lastVolumeOrDefault(r.cfg.DefaultVolume)
+	session, err := NewLegacyReceiverSession(challenge, 0, r.cfg.MiPlayName, sessionVolume,
 		localHost, localPort, peerHost, peerPort)
+	if session != nil {
+		session.onWarn = func(msg string) { r.logger.Warn(msg) }
+	}
 	if err != nil {
 		r.logger.Error("miplay cannot create the session", "error", err)
 		connection.Close()
@@ -272,6 +360,10 @@ func (r *Receiver) handleControl(ctx context.Context, connection net.Conn) {
 		stop := false
 		for _, frame := range frames {
 			report.bumpControlFrames()
+			// 取证：确认音量/播放命令究竟走哪条连接（10-04 真机排查）。
+			r.logger.Debug("miplay command frame", "command", frame.Command,
+				"seq", frame.Sequence, "payload", len(frame.Payload),
+				"payload_hex", hex.EncodeToString(truncateBytes(frame.Payload, 32)))
 			result, stepErr := session.Step(frame, writer.write)
 			if stepErr != nil {
 				report.setError(stepErr.Error())
@@ -284,6 +376,10 @@ func (r *Receiver) handleControl(ctx context.Context, connection net.Conn) {
 				break
 			}
 			if result.VolumeSet {
+				// 立刻记住，不等会话结束：进程随时可能被重启，等 summary 才写就丢了。
+				r.mu.Lock()
+				r.lastVolume = result.Volume
+				r.mu.Unlock()
 				if r.hooks.SetVolume != nil {
 					// The protocol volume is authoritative for the current
 					// source; mirror it onto the hardware mixer.
@@ -306,8 +402,8 @@ func (r *Receiver) handleControl(ctx context.Context, connection net.Conn) {
 				break
 			}
 			if result.OpenRequest != nil {
-				if !r.beginSession(report) {
-					report.setError("concurrent sender rejected")
+				if !r.beginSession(sessionCtx, report) {
+					report.setError("cast could not take the output device")
 					stop = true
 					break
 				}
@@ -334,6 +430,9 @@ func (r *Receiver) handleControl(ctx context.Context, connection net.Conn) {
 	summary := report.summary(session)
 	r.mu.Lock()
 	r.lastSession = summary
+	if summary != nil {
+		r.lastVolume = summary.Volume
+	}
 	r.mu.Unlock()
 	r.logger.Info("miplay control session finished",
 		"peer", peerHost,
@@ -347,33 +446,132 @@ func (r *Receiver) handleControl(ctx context.Context, connection net.Conn) {
 }
 
 // beginSession reserves the exclusive output slot for one sender.
-func (r *Receiver) beginSession(report *sessionRuntime) bool {
-	r.mu.Lock()
-	if r.active != nil {
-		r.mu.Unlock()
-		return false
-	}
-	r.active = report
-	r.mu.Unlock()
-
-	if r.hooks.Claim != nil {
-		if err := r.hooks.Claim(); err != nil {
-			r.mu.Lock()
-			r.active = nil
-			r.mu.Unlock()
-			r.logger.Warn("miplay cast rejected: the sound card is owned by another source", "error", err)
+//
+// A newer sender preempts the current one: the arbitration engine calls back
+// into evictActiveCast, which returns only after the previous aplay has been
+// reaped. Rejecting instead of preempting would leave two half-dead streams
+// racing for one exclusive device, which is what the live box was doing.
+func (r *Receiver) beginSession(ctx context.Context, report *sessionRuntime) bool {
+	if r.hooks.Claim == nil {
+		// No arbitration engine (unit tests build the receiver bare): keep the
+		// receiver-local "one session at a time" rule.
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.active != nil {
 			return false
 		}
+		r.active = report
+		return true
+	}
+
+	// Claims are serialised: two phones racing for the card must not both
+	// believe they won, and a loser must be torn down before the winner starts.
+	r.claimMu.Lock()
+	defer r.claimMu.Unlock()
+
+	req := ClaimRequest{Peer: report.peer, Token: report.token, Evict: r.evictActiveCast}
+	if err := r.hooks.Claim(ctx, req); err != nil {
+		r.logger.Warn("miplay cast rejected", "peer", report.peer, "error", err)
+		return false
 	}
 	r.mu.Lock()
+	previous := r.active
+	r.active = report
 	report.claimed = true
 	r.mu.Unlock()
+
+	if previous != nil && previous != report {
+		// Same phone reconnecting: the engine keeps the slot (same peer, so it
+		// is not a newcomer), but the previous session's carcass still owns the
+		// pipeline. Collect it, or the new session cannot open the device.
+		r.logger.Info("replacing the previous session from the same peer",
+			"peer", previous.peer, "token", previous.token)
+		r.stopCast(previous)
+		r.waitForSessionExit(context.Background(), previous, 3*time.Second)
+	}
 	return true
+}
+
+// evictActiveCast yields the output device to a newer sender. It is handed to
+// the arbitration engine as the current cast's teardown and only returns once
+// the pipeline is gone, so the winner can open hw:0,0 without a
+// "Resource busy" race.
+func (r *Receiver) evictActiveCast(ctx context.Context) error {
+	r.mu.Lock()
+	report := r.active
+	r.mu.Unlock()
+
+	if report == nil {
+		// A pipeline outlived its session (crash path): clear it so the winner
+		// gets a free device.
+		r.pipeline.Stop()
+		return nil
+	}
+
+	r.logger.Info("miplay cast preempted by a newer sender", "peer", report.peer, "token", report.token)
+	r.stopCast(report)
+	return r.waitForSessionExit(ctx, report, 5*time.Second)
+}
+
+// markRetired records that this session is being torn down. It is called before
+// the pipeline is stopped, so that a frame arriving afterwards is dropped
+// instead of restarting ffmpeg/aplay for a session that no longer exists.
+func (s *sessionRuntime) markRetired() {
+	s.retired.Store(true)
+}
+
+// isRetired reports whether this session has entered teardown.
+func (s *sessionRuntime) isRetired() bool {
+	return s.retired.Load()
+}
+
+// stopCast ends one session's media path and blocks until its ffmpeg/aplay are
+// reaped (StopOwned has a bounded grace period inside).
+func (r *Receiver) stopCast(report *sessionRuntime) {
+	if report == nil {
+		return
+	}
+	report.markRetired()
+	if report.conn != nil {
+		// Closing wakes the blocked control read deterministically.
+		_ = report.conn.SetReadDeadline(time.Now())
+		_ = report.conn.Close()
+	}
+	if report.cancelWFD != nil {
+		report.cancelWFD()
+	}
+	r.pipeline.StopOwned(report.token)
+}
+
+// waitForSessionExit blocks until report is no longer the active session: the
+// session goroutine still has to unwind (clear r.active, release its slot).
+func (r *Receiver) waitForSessionExit(ctx context.Context, report *sessionRuntime, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		stillActive := r.active == report
+		r.mu.Unlock()
+		if !stillActive {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	r.logger.Warn("cast did not unwind in time", "peer", report.peer, "token", report.token)
+	return nil
 }
 
 // endSession tears down all session resources and frees the output slot.
 func (r *Receiver) endSession(report *sessionRuntime) {
-	r.pipeline.Stop()
+	// Retire before stopping: the read loop may be parked mid-frame and must not
+	// bring the pipeline back up once this session is gone.
+	report.markRetired()
+	// Ownership-checked: a session that never started the pipeline (for example
+	// one turned away while another cast was live) must not stop it.
+	r.pipeline.StopOwned(report.token)
 	if report.cancelWFD != nil {
 		report.cancelWFD()
 	}
@@ -383,9 +581,11 @@ func (r *Receiver) endSession(report *sessionRuntime) {
 	}
 	claimed := report.claimed
 	report.claimed = false
+	peer := report.peer
+	token := report.token
 	r.mu.Unlock()
 	if claimed && r.hooks.Release != nil {
-		r.hooks.Release()
+		r.hooks.Release(peer, token)
 	}
 }
 
@@ -424,7 +624,7 @@ func (r *Receiver) runWFD(ctx context.Context, request OpenDeviceRequest, sessio
 	rtspCtx, cancelRTSP := context.WithCancel(ctx)
 	defer cancelRTSP()
 	go func() {
-		rtspDone <- r.runRTSPControl(rtspCtx, rtspConnection, request.Host, rtspReadyCh)
+		rtspDone <- r.runRTSPControl(rtspCtx, rtspConnection, request.Host, rtspReadyCh, report, session, writer)
 	}()
 	select {
 	case <-rtspReadyCh:
@@ -467,38 +667,154 @@ func (r *Receiver) runWFD(ctx context.Context, request OpenDeviceRequest, sessio
 			return fmt.Errorf("media framing: %w", err)
 		}
 		for _, frame := range frames {
-			packet, decodeErr := DecodeRTPMPEGTS(frame)
-			if decodeErr != nil {
-				return fmt.Errorf("media packet: %w", decodeErr)
-			}
-			if !r.pipeline.Running() {
-				if startErr := r.pipeline.Start(); startErr != nil {
-					return startErr
+			if err := r.pumpMediaFrame(frame, report, session, writer, &firstPayload); err != nil {
+				if errors.Is(err, errSessionOver) {
+					return nil // 会话已被取代：干净收尾，不是故障
 				}
-			}
-			if writeErr := r.pipeline.Write(packet.TransportStream); writeErr != nil {
-				return writeErr
-			}
-			report.addMedia(int64(len(packet.TransportStream)))
-			// Media flowing again proves the source is playing: drop any stale
-			// pause hint left by an earlier source-side pause command.
-			report.clearPause()
-			if firstPayload {
-				firstPayload = false
-				r.logger.Info("miplay first media payload decoded", "ts_bytes", len(packet.TransportStream))
-				if notifyErr := session.MediaStarted(writer.write); notifyErr != nil {
-					r.logger.Warn("miplay media-started notification failed", "error", notifyErr)
-				}
+				return err
 			}
 		}
 	}
 }
 
+// ensurePipeline makes the realtime pipeline live and owned by this session.
+//
+// Two rules, and the live 2026-10-05 outage was a violation of both:
+//
+//   - Only the session that currently holds the card may own the pipeline, and a
+//     session that has entered teardown may never touch it again. Otherwise a
+//     superseded session's late frame keeps a writer alive on the exclusive
+//     device.
+//   - The pipeline is *reclaimed*, not merely started. A pipeline left behind by
+//     a session that is already gone has to be collected, because reporting it
+//     as busy is what made every frame of the next cast fail and left the owner
+//     with no sound at all.
+func (r *Receiver) ensurePipeline(report *sessionRuntime) error {
+	if report.isRetired() {
+		return errSessionOver
+	}
+	r.mu.Lock()
+	active := r.active == report
+	r.mu.Unlock()
+	if !active {
+		return errSessionOver
+	}
+
+	replaced, err := r.pipeline.Reclaim(report.token)
+	if replaced != "" {
+		r.logger.Warn("reclaimed the realtime pipeline from a session that already ended",
+			"token", report.token, "stale_owner", replaced)
+	}
+	return err
+}
+
+// pumpMediaFrame decodes one wire media frame (RTP/MPEG-TS payload) into the
+// realtime pipeline. Both the dedicated media leg and the RTSP control leg (where
+// MiUI interleaves media frames) funnel through here so the first-payload
+// bookkeeping and the media-started notification happen exactly once per session.
+func (r *Receiver) pumpMediaFrame(frame []byte, report *sessionRuntime, session *LegacyReceiverSession,
+	writer *controlWriter, firstPayload *bool) error {
+	packet, err := DecodeRTPMPEGTS(frame)
+	if err != nil {
+		return fmt.Errorf("media packet: %w", err)
+	}
+	// Owner-aware and self-healing: a session that finds a pipeline belonging to
+	// somebody else must not feed a second writer, but the session holding the
+	// card collects the leftover instead of failing every frame.
+	if startErr := r.ensurePipeline(report); startErr != nil {
+		return startErr
+	}
+	if err := r.pipeline.Write(packet.TransportStream); err != nil {
+		return err
+	}
+	report.addMedia(int64(len(packet.TransportStream)))
+	// Media flowing again proves the source is playing: drop any stale
+	// pause hint left by an earlier source-side pause command.
+	report.clearPause()
+	// Playhead bookkeeping for the console: stamp the first frame of the
+	// session and restart whenever the phone reports a different track.
+	report.markMediaStart()
+	report.noteTrack(session.TrackVersion())
+	if *firstPayload {
+		*firstPayload = false
+		r.logger.Info("miplay first media payload decoded", "ts_bytes", len(packet.TransportStream))
+		if notifyErr := session.MediaStarted(writer.write); notifyErr != nil {
+			r.logger.Warn("miplay media-started notification failed", "error", notifyErr)
+		}
+	}
+	return nil
+}
+
+// decodeScalarVolume reads a bare four-byte big-endian volume, rejecting values
+// outside 0..100 so a malformed frame is ignored instead of clamping the mixer.
+func decodeScalarVolume(payload []byte) (int, bool) {
+	if len(payload) != 4 {
+		return 0, false
+	}
+	volume := int(binary.BigEndian.Uint32(payload))
+	if volume < 0 || volume > 100 {
+		return 0, false
+	}
+	return volume, true
+}
+
+// decryptVolume unwraps a SafetyData-wrapped SetVolume and returns the percentage.
+// It never returns an error to the caller: an IV that has not settled yet is a
+// transient condition, and tearing the session down over it is far worse than
+// skipping one command.
+func (s *LegacyReceiverSession) decryptVolume(payload []byte) (int, bool) {
+	plain, err := s.safety.decryptEnvelope(payload, false)
+	if err != nil {
+		return 0, false
+	}
+	if volume, ok := decodeScalarVolume(plain); ok {
+		return volume, true
+	}
+	// 信封内可能还包了一层 Safety envelope，解开后重试。
+	if inner, innerErr := decodeSafetyEnvelope(plain, boolPointer(false)); innerErr == nil {
+		if volume, ok := decodeScalarVolume(inner); ok {
+			return volume, true
+		}
+	}
+	return 0, false
+}
+
+// loggerWarn routes a warning through the session logger when the receiver wired one.
+func (s *LegacyReceiverSession) loggerWarn(msg string) {
+	if s.onWarn != nil {
+		s.onWarn(msg)
+	}
+}
+
 // runRTSPControl drives the RTSP ladder on the first source connection and
 // signals rtspReadyCh once the session reaches READY.
-func (r *Receiver) runRTSPControl(ctx context.Context, connection net.Conn, sourceAddress string, rtspReadyCh chan<- struct{}) error {
-	session := NewReceiverRtspSession(sourceAddress)
+func (r *Receiver) runRTSPControl(ctx context.Context, connection net.Conn, sourceAddress string,
+	rtspReadyCh chan<- struct{}, report *sessionRuntime, session *LegacyReceiverSession,
+	writer *controlWriter) error {
+	// MiUI 会把媒体帧（0x24 帧头）混写在这条 RTSP 控制连接上，实测（10-04）：
+	// 接收端按连接序号假定媒体走 connections[2]，但真机并没有那样分。所以这里
+	// 把控制腿上剥下来的媒体帧直接喂给播放管线，否则连接虽然活着却全程无声。
+	firstPayload := true // 控制腿也有媒体帧，首帧通知必须触发（与媒体腿一致）
+	var mediaMu sync.Mutex
+	mediaOver := false
+	rtspSession := NewReceiverRtspSession(sourceAddress)
 	decoder := NewRTSPDecoder()
+	decoder.SetMediaSink(func(frame []byte) {
+		mediaMu.Lock()
+		defer mediaMu.Unlock()
+		if mediaOver {
+			return
+		}
+		if err := r.pumpMediaFrame(frame, report, session, writer, &firstPayload); err != nil {
+			if errors.Is(err, errSessionOver) {
+				// 本会话已被取代/已断开：此后静默丢帧。真机 14:01 那条每秒几十条
+				// 的 "control-leg media frame failed" 刷屏就出在这里。
+				mediaOver = true
+				return
+			}
+			r.logger.Warn("miplay control-leg media frame failed", "error", err)
+		}
+	})
 	buffer := make([]byte, 16*1024)
 	for {
 		if ctx.Err() != nil {
@@ -520,7 +836,23 @@ func (r *Receiver) runRTSPControl(ctx context.Context, connection net.Conn, sour
 			return err
 		}
 		for _, message := range messages {
-			transition, err := session.Process(message)
+			// 取证：RTSP 控制腿上真正跑通的是这条连接，手机的音量/播放命令很可能
+			// 也走这里。记录首行与头名，便于核对协议形状（10-04 真机排查用）。
+			r.logger.Debug("miplay rtsp message", "start", message.StartLine,
+				"headers", len(message.Headers), "body", len(message.Body))
+			// 取证：元数据可能藏在 RTSP 头（自定义 header）或 body 里，打出来核对。
+			if len(message.Body) > 0 {
+				r.logger.Debug("miplay rtsp body", "hex",
+					hex.EncodeToString(truncateBytes(message.Body, 48)),
+					"text", truncateForLog(string(message.Body), 200))
+			}
+			for _, h := range message.Headers {
+				if !isStandardRTSPHeader(h.Name) {
+					r.logger.Debug("miplay rtsp custom header", "name", h.Name,
+						"value", truncateForLog(h.Value, 200))
+				}
+			}
+			transition, err := rtspSession.Process(message)
 			if err != nil {
 				return err
 			}
@@ -552,25 +884,23 @@ func (r *Receiver) Disconnect() (bool, error) {
 		return false, nil
 	}
 	r.logger.Info("miplay disconnect requested", "peer", report.peer)
-	if report.conn != nil {
-		_ = report.conn.SetReadDeadline(time.Now())
-		_ = report.conn.Close()
-	}
-	if report.cancelWFD != nil {
-		report.cancelWFD()
-	}
+	// Operator-initiated: this one may force the device free even if the
+	// pipeline is not the session's own.
+	r.stopCast(report)
 	r.pipeline.Stop()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		r.mu.Lock()
-		stillActive := r.active == report
-		r.mu.Unlock()
-		if !stillActive {
-			return true, nil
-		}
-		time.Sleep(50 * time.Millisecond)
+	return true, r.waitForSessionExit(context.Background(), report, 5*time.Second)
+}
+
+// lastVolumeOrDefault reports the volume to echo when no session is active.
+// Without this the phone sees DefaultVolume on every reconnect and its slider
+// snaps back to 100% (or whatever the startup default is) after each cast.
+func (r *Receiver) lastVolumeOrDefault(fallback int) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.lastVolume >= 0 {
+		return r.lastVolume
 	}
-	return true, nil
+	return fallback
 }
 
 // Status returns the MiPlay slice of /api/status.
@@ -585,7 +915,7 @@ func (r *Receiver) Status() Status {
 		Advertising: r.responder.Advertising(),
 		ListenPort:  r.cfg.MiPlayControlPort,
 		DeviceID:    r.responder.Identity().canonicalUUID(),
-		Volume:      r.cfg.DefaultVolume,
+		Volume:      r.lastVolumeOrDefault(r.cfg.DefaultVolume),
 		State:       "idle",
 		Pipeline:    r.pipeline.Stats(),
 		LastSession: lastSession,
@@ -603,12 +933,19 @@ func (r *Receiver) Status() Status {
 	} else if status.Pipeline.Running {
 		status.State = "streaming"
 	}
+	status.PositionSource = PositionSourceNone
 	if report.session != nil {
 		status.SourceName = report.session.SourceName()
 		status.Volume = report.session.Volume()
 		status.Safety = report.session.SafetyDiagnostics()
 		status.MediaInfo = report.session.MediaInfo()
+		status.DurationSeconds = report.session.DurationSeconds()
+		status.CoverURL = report.session.CoverURL()
 		status.LastSession = nil
+	}
+	if elapsed, measured := report.elapsed(); measured {
+		status.PositionSeconds = elapsed.Seconds()
+		status.PositionSource = PositionSourceLocalEstimate
 	}
 	status.MediaFrames, status.MediaBytes = report.mediaTotals()
 	return status
@@ -697,8 +1034,68 @@ func (s *sessionRuntime) setRTSPReady(value bool) {
 
 func (s *sessionRuntime) setPaused(value bool) {
 	s.mu.Lock()
-	s.paused = value
+	s.setPausedLocked(value)
 	s.mu.Unlock()
+}
+
+// setPausedLocked also maintains the pause ledger that the console's playhead
+// reads: while the phone says it is paused, elapsed time must stand still.
+func (s *sessionRuntime) setPausedLocked(value bool) {
+	if value == s.paused {
+		return
+	}
+	s.paused = value
+	if value {
+		s.pausedAt = time.Now()
+		return
+	}
+	if !s.pausedAt.IsZero() {
+		s.pausedTotal += time.Since(s.pausedAt)
+		s.pausedAt = time.Time{}
+	}
+}
+
+// markMediaStart stamps the first media frame of the session.
+func (s *sessionRuntime) markMediaStart() {
+	s.mu.Lock()
+	if s.mediaStartedAt.IsZero() {
+		s.mediaStartedAt = time.Now()
+	}
+	s.mu.Unlock()
+}
+
+// noteTrack restarts the playhead when the phone moves to another song: the
+// console must not show the previous track's elapsed time under the new title.
+func (s *sessionRuntime) noteTrack(version int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if version == s.trackVersion {
+		return
+	}
+	s.trackVersion = version
+	s.mediaStartedAt = time.Now()
+	s.pausedTotal = 0
+	s.pausedAt = time.Time{}
+}
+
+// elapsed reports the locally measured playhead of the active cast. The second
+// return value is false until the first media frame has arrived, so the caller
+// can say "unknown" instead of showing 0:00 as if it were measured.
+func (s *sessionRuntime) elapsed() (time.Duration, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.mediaStartedAt.IsZero() {
+		return 0, false
+	}
+	frozen := s.pausedTotal
+	if !s.pausedAt.IsZero() {
+		frozen += time.Since(s.pausedAt)
+	}
+	elapsed := time.Since(s.mediaStartedAt) - frozen
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	return elapsed, true
 }
 
 func (s *sessionRuntime) bumpControlFrames() {
@@ -722,7 +1119,7 @@ func (s *sessionRuntime) isPaused() bool {
 
 func (s *sessionRuntime) clearPause() {
 	s.mu.Lock()
-	s.paused = false
+	s.setPausedLocked(false)
 	s.mu.Unlock()
 }
 
@@ -737,6 +1134,7 @@ func (s *sessionRuntime) summary(session *LegacyReceiverSession) *SessionSummary
 	defer s.mu.Unlock()
 	return &SessionSummary{
 		Peer:          s.peer,
+		Volume:        session.Volume(),
 		StartedAt:     s.startedAt,
 		EndedAt:       time.Now().UTC(),
 		Authenticated: session.Authenticated(),
@@ -749,4 +1147,23 @@ func (s *sessionRuntime) summary(session *LegacyReceiverSession) *SessionSummary
 		Error:         s.lastError,
 		Trace:         session.Trace(),
 	}
+}
+
+// truncateBytes caps a payload for logging so a debug line never dumps megabytes.
+func truncateBytes(data []byte, limit int) []byte {
+	if len(data) <= limit {
+		return data
+	}
+	return data[:limit]
+}
+
+// isStandardRTSPHeader reports whether a header is part of plain RTSP, so the
+// debug trace only surfaces the custom ones where MiUI carries metadata.
+func isStandardRTSPHeader(name string) bool {
+	switch strings.ToLower(name) {
+	case "cseq", "content-length", "content-type", "session", "transport",
+		"range", "user-agent", "authorization", "www-authenticate", "public":
+		return true
+	}
+	return false
 }
