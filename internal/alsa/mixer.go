@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miplay-bridge/miplay-bridge/internal/config"
@@ -86,6 +87,10 @@ type Mixer struct {
 
 	mu    sync.Mutex
 	state State
+	// chainedPinned records that PCM/Master were already brought to full scale, so
+	// per-adjustment volume changes never write them again. SetVolume is called both
+	// from the HTTP handlers and from the MiPlay control loop, so it is atomic.
+	chainedPinned atomic.Bool
 }
 
 // New creates a Mixer bound to the configured card.
@@ -239,12 +244,51 @@ func (m *Mixer) Init(ctx context.Context) (State, error) {
 		"Front",
 		"Digital",
 	}
+	// The effective control is the first candidate the card actually exposes; it is
+	// the one the volume slider drives. Everything else on a serial chain
+	// (PCM / Master on Realtek HDA parts) is fixed line attenuation.
+	effective := ""
+	for _, candidate := range candidates {
+		if candidate != "" && known[candidate] {
+			effective = candidate
+			break
+		}
+	}
+	if effective == "" && len(controls) > 0 {
+		for _, c := range controls {
+			if c != m.cfg.AutoMuteControl {
+				effective = c
+				break
+			}
+		}
+	}
+
 	var targets []target
+	// Built-in speakers are an independent mixer path on ALC269VB-class codecs:
+	// plugging a 3.5mm jack does NOT mute them, so a cast plays out of the
+	// laptop's own speaker as well as the external one. ALSA_MUTE_SPEAKER keeps
+	// the built-in path off so only the plugged-in output is used. Default stays
+	// "unmute" to preserve upstream behaviour.
+	muteSpeaker := m.cfg.MuteSpeaker
 	for _, c := range candidates {
 		if c != "" && known[c] {
+			if c == m.cfg.SpeakerControl && muteSpeaker {
+				targets = append(targets, target{
+					name:   c,
+					values: []string{"0%", "mute"},
+				})
+				continue
+			}
+			// PCM/Master 是线路衰减而非音量级，固定 100%：见 SetVolume 的说明。
+			// 但当卡上只有其一、且它就是有效音量控制时（例如只有 PCM 的 USB DAC），
+			// 不能钉满——否则启动音量会从 DefaultVolume 被抬到 100%。
+			level := fmt.Sprintf("%d%%", m.cfg.DefaultVolume)
+			if (c == "PCM" || c == "Master") && c != effective {
+				level = "100%"
+			}
 			targets = append(targets, target{
 				name:   c,
-				values: []string{fmt.Sprintf("%d%%", m.cfg.DefaultVolume), "unmute"},
+				values: []string{level, "unmute"},
 			})
 		}
 	}
@@ -279,22 +323,7 @@ func (m *Mixer) Init(ctx context.Context) (State, error) {
 
 	// Step 3: verify. Headphone is the jack we care about; Master is the
 	// fallback for cards without a Headphone control; then PCM, etc.
-	effective := ""
-	for _, candidate := range candidates {
-		if candidate != "" && known[candidate] {
-			effective = candidate
-			break
-		}
-	}
-	if effective == "" && len(controls) > 0 {
-		for _, c := range controls {
-			if c != m.cfg.AutoMuteControl {
-				effective = c
-				break
-			}
-		}
-	}
-
+	// (the effective control was resolved before the unmute pass above)
 	if effective == "" {
 		m.logger.Warn("no hardware playback mixer control found on this card; falling back to software volume", "card", m.cfg.Card)
 		state.EffectiveControl = ""
@@ -364,17 +393,117 @@ func (m *Mixer) SetVolume(ctx context.Context, percent int) (State, error) {
 		})
 		return m.State(), nil
 	}
-	if _, err := m.SimpleSet(ctx, control, fmt.Sprintf("%d%%", percent), "unmute"); err != nil {
-		if _, err2 := m.SimpleSet(ctx, control, fmt.Sprintf("%d%%", percent)); err2 != nil {
+	values := []string{fmt.Sprintf("%d%%", percent), "unmute"}
+	if curveArg, ok := volumeCurveDB(m.cfg.VolumeCurve, percent); ok {
+		// A negative dB value starts with "-", which amixer would parse as an
+		// option ("amixer: invalid option -- '2'"); "--" separates it. Verified
+		// against amixer 1.2.14: `sset <control> -- "-20dB" unmute` is accepted.
+		values = []string{"--", curveArg, "unmute"}
+	}
+	if _, err := m.SimpleSet(ctx, control, values...); err != nil {
+		if _, err2 := m.SimpleSet(ctx, control, values[:len(values)-1]...); err2 != nil {
 			return m.State(), err
 		}
 	}
+	// On serial-mixer codecs (ALC269VB: Headphone → PCM → Master) the downstream
+	// stages are fixed line attenuation, NOT part of the volume control. They must
+	// stay pinned at full scale: scaling them together with the effective control makes
+	// the attenuation multiply, so 30% collapses to near silence and the slider becomes
+	// a cliff. They are pinned, never re-set per adjustment — PCM in particular is a
+	// digital pre-volume whose writes make ALSA close and reopen the PCM stream, which
+	// is audible as crackle/distortion while music plays.
+	// The primary control was set above; only the pinned line-attenuation controls
+	// are touched here, and only once (see pinChainedLineControls).
+	m.pinChainedLineControls(ctx)
 	m.setState(func(s *State) {
 		s.VolumePercent = percent
 		s.Muted = false
 		s.Verified = true
 	})
 	return m.State(), nil
+}
+
+// volumeCurveDB maps a MiPlay volume percentage onto an amixer dB argument when a
+// curve is configured, and reports whether it applied.
+//
+// Why dB: `amixer sset <control> "30%"` maps the percentage linearly onto the
+// control's RAW scale (amixer.c: convert_prange1). On ALC269VB the Headphone raw
+// scale is 0..87 steps of 0.75 dB (0 .. -65.25 dB), so 30% lands on raw 26 =
+// -45.75 dB - about 0.5% of full amplitude, i.e. the "collapsed middle" the slider
+// shows. Passing "-30dB" instead makes amixer call
+// snd_mixer_selem_set_playback_dB(), writing the requested attenuation directly.
+//
+// Note the cubic "mapped volume" of alsamixer is NOT involved either way: it only
+// applies when amixer runs with -M. Measured on the target card, all nine
+// percentage steps land exactly where the linear raw map predicts.
+func volumeCurveDB(curve []config.VolumeCurvePoint, percent int) (string, bool) {
+	if len(curve) < 2 {
+		return "", false
+	}
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	for i := 1; i < len(curve); i++ {
+		upper := curve[i]
+		if percent > upper.Percent {
+			continue
+		}
+		lower := curve[i-1]
+		span := upper.Percent - lower.Percent
+		if span <= 0 {
+			return fmt.Sprintf("%ddB", upper.DB), true
+		}
+		db := lower.DB + (percent-lower.Percent)*(upper.DB-lower.DB)/span
+		return fmt.Sprintf("%ddB", db), true
+	}
+	return fmt.Sprintf("%ddB", curve[len(curve)-1].DB), true
+}
+
+// pinChainedLineControls brings PCM and Master to full scale once, at init time.
+// PCM is a digital pre-volume: writing it while audio is playing makes ALSA close
+// and reopen the PCM stream, which is audible as crackle and a warbling pitch while
+// music plays. Pinning it once at startup (and never per adjustment) keeps the
+// line attenuation out of the per-drag path, so dragging the slider only touches the
+// analogue gain control, which is silent.
+func (m *Mixer) pinChainedLineControls(ctx context.Context) {
+	if m.chainedPinned.Load() {
+		return
+	}
+	for _, chained := range m.chainedVolumeControls() {
+		if _, err := m.SimpleSet(ctx, chained, "100%", "unmute"); err != nil {
+			if _, err2 := m.SimpleSet(ctx, chained, "100%"); err2 != nil {
+				m.logger.Warn("chained line-attenuation control pin failed",
+					"control", chained, "error", err)
+			}
+		}
+	}
+	m.chainedPinned.Store(true)
+}
+
+// chainedVolumeControls returns the downstream controls that sit between the
+// effective control and the speaker on codecs with a serial mixer chain. PCM is
+// the digital pre-volume and Master is the final output stage on Realtek
+// HDA parts; without them the audible level lags far behind the effective
+// control. Controls absent from the card are skipped.
+func (m *Mixer) chainedVolumeControls() []string {
+	present := map[string]bool{}
+	for _, name := range m.State().Controls {
+		present[name] = true
+	}
+	effective := m.State().EffectiveControl
+	chain := []string{}
+	for _, name := range []string{"PCM", "Master"} {
+		if name == effective {
+			continue
+		}
+		if present[name] {
+			chain = append(chain, name)
+		}
+	}
+	return chain
 }
 
 // SetMute toggles the hardware switch of the effective control.
