@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"io"
 	"net"
-	"sync"
 	"testing"
 	"time"
 
@@ -23,6 +22,7 @@ type controlTestHarness struct {
 }
 
 func newControlTestHarness(t *testing.T, handshakeTimeout time.Duration) *controlTestHarness {
+	t.Helper()
 	return newControlTestHarnessWithHooks(t, handshakeTimeout, Hooks{})
 }
 
@@ -136,56 +136,26 @@ func TestControlHandshakeTimeoutGuardsUnauthenticatedConnections(t *testing.T) {
 	}
 }
 
-// TestControlVolumeFollowsTheHardwareMixer pins the receiver-level volume
-// contract behind the phone-slider spring-back fix: a fresh control
-// connection starts from the live hardware level (not the configured
-// default), a level change from outside the phone is answered on the very
-// next query, and SET_VOLUME still mirrors onto the hardware through the
-// hook.
-func TestControlVolumeFollowsTheHardwareMixer(t *testing.T) {
-	var levelMu sync.Mutex
-	level := 37
-	available := true
-	mirrored := make(chan int, 4)
-	hooks := Hooks{
-		Volume: func() (int, bool) {
-			levelMu.Lock()
-			defer levelMu.Unlock()
-			return level, available
-		},
-		SetVolume: func(percent int) { mirrored <- percent },
-	}
-	harness := newControlTestHarnessWithHooks(t, time.Second, hooks)
+// TestControlVolumeCommandsDriveTheSession pins the receiver-level volume
+// contract: GET_VOLUME answers the live hardware level when a mixer is
+// wired, SET_VOLUME records the decoded level and mirrors it through the
+// hook, and neither command ever ends the control session.
+func TestControlVolumeCommandsDriveTheSession(t *testing.T) {
+	mirror := make(chan int, 4)
+	harness := newControlTestHarnessWithHooks(t, time.Second, Hooks{
+		SetVolume: func(percent int) { mirror <- percent },
+		Volume:    func() (int, bool) { return 51, true },
+	})
 	harness.authenticate(t)
 
-	// The session started from the live hardware level: even when the live
-	// reader is gone, the first query answers 37 - not the configured
-	// default (80).
-	levelMu.Lock()
-	available = false
-	levelMu.Unlock()
 	if _, err := harness.client.Write(EncodeCommand(CmdGetVolume, 3, nil)); err != nil {
 		t.Fatalf("write get volume: %v", err)
 	}
 	frame := readCommandFrame(t, harness.client)
-	if frame.Command != CmdGetVolumeAck || frame.Sequence != 3 || !bytes.Equal(frame.Payload, EncodeScalar(37)) {
-		t.Fatalf("reply = %+v, want the starting hardware level 37", frame)
+	if frame.Command != CmdGetVolumeAck || frame.Sequence != 3 || !bytes.Equal(frame.Payload, EncodeScalar(51)) {
+		t.Fatalf("reply = %+v, want the live hardware level 51", frame)
 	}
 
-	// The console moves the volume: the next query follows immediately.
-	levelMu.Lock()
-	available = true
-	level = 12
-	levelMu.Unlock()
-	if _, err := harness.client.Write(EncodeCommand(CmdGetVolume, 4, nil)); err != nil {
-		t.Fatalf("write get volume: %v", err)
-	}
-	frame = readCommandFrame(t, harness.client)
-	if !bytes.Equal(frame.Payload, EncodeScalar(12)) {
-		t.Fatalf("reply payload = % x, want the updated live level 12", frame.Payload)
-	}
-
-	// SET_VOLUME is still acknowledged and mirrored onto the hardware.
 	if _, err := harness.client.Write(EncodeCommand(CmdSetVolume, 5, EncodeScalar(64))); err != nil {
 		t.Fatalf("write set volume: %v", err)
 	}
@@ -194,17 +164,65 @@ func TestControlVolumeFollowsTheHardwareMixer(t *testing.T) {
 		t.Fatalf("reply = %+v, want the set-volume acknowledgement", frame)
 	}
 	select {
-	case got := <-mirrored:
-		if got != 64 {
-			t.Fatalf("mirrored volume = %d, want 64", got)
+	case percent := <-mirror:
+		if percent != 64 {
+			t.Fatalf("mirrored volume = %d, want 64", percent)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("SET_VOLUME never reached the hardware hook")
+		t.Fatal("the set-volume hook was not invoked")
+	}
+}
+
+// TestControlVolumeFallsBackToTheDefault pins the degraded path: without a
+// mixer hook the session starts from BRIDGE_VOLUME_DEFAULT and GET_VOLUME
+// answers that level instead of failing.
+func TestControlVolumeFallsBackToTheDefault(t *testing.T) {
+	harness := newControlTestHarness(t, time.Second)
+	harness.authenticate(t)
+
+	if _, err := harness.client.Write(EncodeCommand(CmdGetVolume, 3, nil)); err != nil {
+		t.Fatalf("write get volume: %v", err)
+	}
+	frame := readCommandFrame(t, harness.client)
+	want := EncodeScalar(uint32(config.Default().VolumeDefault))
+	if frame.Command != CmdGetVolumeAck || frame.Sequence != 3 || !bytes.Equal(frame.Payload, want) {
+		t.Fatalf("reply = %+v, want the configured default level", frame)
+	}
+}
+
+// TestStatusReportsTheLiveVolume pins the status contract behind reconnects:
+// whenever a mixer hook is wired /api/status carries the live hardware level -
+// before the first session and while a session is active - so a second phone
+// or a reconnect never sees the level snap back to a stale copy.
+func TestStatusReportsTheLiveVolume(t *testing.T) {
+	harness := newControlTestHarnessWithHooks(t, time.Second, Hooks{
+		Volume: func() (int, bool) { return 51, true },
+	})
+
+	// Idle: no session yet, still the live level instead of the default.
+	if got := harness.receiver.Status().Volume; got != 51 {
+		t.Fatalf("idle status volume = %d, want the live level 51", got)
 	}
 
-	// The status slice reports the live level, not a stale session copy.
-	if status := harness.receiver.Status(); status.Volume != 12 {
-		t.Fatalf("status volume = %d, want the live level 12", status.Volume)
+	// An active session whose own copy (30) disagrees with the hardware (51):
+	// the session copy must never be the reported level.
+	session, err := NewLegacyReceiverSession([]byte(testChallenge), 0, "miplay test", 30,
+		testLocalHost, testLocalPort, testPeerHost, testPeerPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := &sessionRuntime{peer: testPeerHost, startedAt: time.Now().UTC(), session: session}
+	if !harness.receiver.beginSession(report) {
+		t.Fatal("cannot reserve the output slot for the synthetic session")
+	}
+	t.Cleanup(func() { harness.receiver.endSession(report) })
+
+	status := harness.receiver.Status()
+	if !status.Connected {
+		t.Fatal("synthetic session is not reported as connected")
+	}
+	if status.Volume != 51 {
+		t.Fatalf("connected status volume = %d, want the live level 51", status.Volume)
 	}
 }
 

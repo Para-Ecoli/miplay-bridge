@@ -37,9 +37,9 @@ type ControlResult struct {
 	Reason string
 	// OpenRequest is set when the frame was the OPEN handover.
 	OpenRequest *OpenDeviceRequest
-	// VolumeSet reports a new SET_VOLUME value.
+	// VolumeSet reports that the frame carried an accepted SET_VOLUME value.
 	VolumeSet bool
-	// Volume is the accepted volume percentage.
+	// Volume is the accepted volume percentage (0-100).
 	Volume int
 	// PauseRequested / ResumeRequested / CloseRequested mirror the transport
 	// commands so the receiver can act on the realtime pipeline.
@@ -69,9 +69,9 @@ type LegacyReceiverSession struct {
 	friendlyName      string
 	volume            int
 	// volumeProvider, when wired, reports the live hardware volume. The
-	// session answers GET_VOLUME with it so a level the console changed after
-	// the phone connected is reported truthfully. Invoked with the session
-	// lock held.
+	// session answers GET_VOLUME with it so a level the console or the phone
+	// changed after the connection was established is reported truthfully.
+	// Invoked with the session lock held.
 	volumeProvider func() (int, bool)
 
 	phase             ControlPhase
@@ -104,7 +104,7 @@ func NewLegacyReceiverSession(challenge []byte, challengeSequence uint16, friend
 		}
 	}
 	if volume < 0 || volume > 100 {
-		return nil, fmt.Errorf("volume out of range")
+		return nil, fmt.Errorf("legacy volume must be 0 to 100")
 	}
 	return &LegacyReceiverSession{
 		challenge:         append([]byte(nil), challenge...),
@@ -157,7 +157,7 @@ func (s *LegacyReceiverSession) MediaInfo() map[string]string {
 	return snapshot
 }
 
-// Volume reports the current protocol volume.
+// Volume reports the session's own volume copy (0-100).
 func (s *LegacyReceiverSession) Volume() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()

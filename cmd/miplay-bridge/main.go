@@ -3,16 +3,14 @@
 // Responsibilities, in startup order:
 //
 //  1. probe the host sound card through /dev/snd (NEVER /proc/asound, which is
-//     not readable inside the container);
-//  2. force `Auto-Mute Mode = Disabled` and unmute Master/Headphone/Speaker,
-//     then verify the result — without this the whole feature is silent while
-//     every API answers "ok";
-//  3. render /etc/mpd.conf and supervise the MPD playback kernel (serves the
+//     not readable inside the container); the bridge never touches ALSA mixer
+//     controls;
+//  2. render /etc/mpd.conf and supervise the MPD playback kernel (serves the
 //     DLNA session and every URL submitted through the HTTP API);
-//  4. bring up the sound-card arbitration engine, the MiPlay receiver (mDNS
+//  3. bring up the sound-card arbitration engine, the MiPlay receiver (mDNS
 //     advertising, binary control channel, ffmpeg|aplay realtime pipeline)
 //     and the DLNA MediaRenderer (SSDP + SOAP + GENA);
-//  5. serve the HTTP API, the DLNA device paths and the
+//  4. serve the HTTP API, the DLNA device paths and the
 //     embedded console on port 8092.
 //
 // MPD is GPL-2.0 third-party software executed as an independent process; this
@@ -38,6 +36,7 @@ import (
 	"github.com/miplay-bridge/miplay-bridge/internal/dlna"
 	"github.com/miplay-bridge/miplay-bridge/internal/logging"
 	"github.com/miplay-bridge/miplay-bridge/internal/miplay"
+	"github.com/miplay-bridge/miplay-bridge/internal/mix"
 	"github.com/miplay-bridge/miplay-bridge/internal/mpd"
 	"github.com/miplay-bridge/miplay-bridge/internal/output"
 )
@@ -48,7 +47,6 @@ const (
 	exitOK               = 0
 	exitConfig           = 2
 	exitSoundCardMissing = 3
-	exitMixerNotReady    = 4
 	exitKernelFailed     = 5
 	exitReceiverFailed   = 6
 )
@@ -112,8 +110,7 @@ func run() error {
 	defer stop()
 
 	// Step 1: sound card self-check.
-	mixer := alsa.New(cfg, logger)
-	report, probeErr := alsa.Probe(ctx, cfg, mixer, logger)
+	report, probeErr := alsa.Probe(cfg, logger)
 	if probeErr != nil {
 		logger.Error("sound card self-check failed: this container does not apply to this host",
 			"error", probeErr,
@@ -125,36 +122,13 @@ func run() error {
 		"device", report.HardwareDevice,
 		"pcm_access", report.PCMAccess,
 		"control_access", report.ControlAccess,
-		"controls", strings.Join(report.ControlNames, ", "),
 	)
 
-	// Step 2 (the decisive step): mixer initialisation.
-	mixerState, mixerErr := mixer.Init(ctx)
-	if mixerErr != nil {
-		logger.Error("mixer initialisation failed; refusing to start the playback kernel to avoid a silent-but-green container",
-			"error", mixerErr,
-			"auto_mute_state", mixerState.AutoMuteState,
-			"hint", "check `amixer -c "+fmt.Sprint(cfg.Card)+" scontrols` on the host and set ALSA_* control names to match",
-		)
-		return &exitError{code: exitMixerNotReady, err: mixerErr}
-	}
-	if !mixerState.AutoMuteFixed {
-		logger.Warn("Auto-Mute Mode was not disabled; if there is no sound, this is the first thing to check",
-			"auto_mute_state", mixerState.AutoMuteState)
-	}
-
-	// Step 3: MPD playback kernel.
+	// Step 2: MPD playback kernel.
 	manager := mpd.NewManager(cfg, logger)
 	if err := manager.LoadTemplate(); err != nil {
 		logger.Error("could not load the MPD configuration template", "error", err)
 		return &exitError{code: exitKernelFailed, err: err}
-	}
-	volumeControl := mixerControlFor(report, cfg, mixerState.EffectiveControl)
-	manager.SetMixerControl(volumeControl)
-	if volumeControl != "" {
-		logger.Info("mpd volume control bound to the hardware mixer", "control", volumeControl)
-	} else {
-		logger.Warn("mpd has no hardware mixer control; its volume falls back to software mixing", "hint", "set MPD_MIXER_CONTROL to a control the card exposes")
 	}
 	if err := manager.Start(ctx); err != nil {
 		logger.Error("could not start the MPD playback kernel", "error", err)
@@ -162,16 +136,28 @@ func run() error {
 	}
 	manager.Supervise(ctx)
 
-	// Step 3b: sound-card arbitration engine. Every writer (MiPlay, DLNA,
+	// Step 3: sound-card arbitration engine. Every writer (MiPlay, DLNA,
 	// API) goes through the engine, so the exclusive ALSA device is never
 	// claimed twice.
-	engine := output.New(cfg, logger, manager, mixer)
+	engine := output.New(cfg, logger, manager)
 	engine.Supervise(ctx)
 
-	// Apply the configured default volume through the engine so the hardware
-	// mixer and the kernel start from the same predictable level.
-	if _, err := engine.SetVolume(ctx, cfg.DefaultVolume); err != nil {
-		logger.Warn("could not apply the default volume", "error", err, "volume", cfg.DefaultVolume)
+	// Step 3b: hardware mixer. The console panel may drive any control; the
+	// MiPlay and DLNA protocol volume paths drive the designated system
+	// control resolved once here. A card without a usable control degrades
+	// those two protocols to their fixed full-scale answers without ever
+	// blocking startup.
+	mixer := mix.New(cfg, logger)
+	engine.SetSystemMixer(mixer)
+	if state, mixerErr := mixer.State(ctx); mixerErr != nil {
+		logger.Warn("hardware mixer state is unavailable; the console panel and the protocol volume degrade",
+			"error", mixerErr, "amixer", cfg.AmixerPath)
+	} else if control := mix.ResolveSystemControl(state, cfg.VolumeControl); control != "" {
+		mixer.SetSystemControl(control)
+		logger.Info("protocol volume bound to the hardware mixer", "volume_control", control, "card", cfg.Card)
+	} else {
+		logger.Warn("no ALSA control carries a playback volume; the phone slider and DLNA volume stay at full scale",
+			"hint", "set BRIDGE_VOLUME_CONTROL to a control listed by `amixer scontrols`")
 	}
 
 	// Step 4: MiPlay receiver (mDNS + control channel + realtime pipeline).
@@ -209,11 +195,11 @@ func run() error {
 		Config: cfg,
 		Logger: logger,
 		Report: report,
-		Mixer:  mixer,
 		Engine: engine,
 		MiPlay: receiver,
 		DLNA:   renderer,
 		Tone:   tone,
+		Mixer:  mixer,
 	})
 	httpServer := &http.Server{
 		Addr:              cfg.Addr(),
@@ -267,8 +253,13 @@ func run() error {
 
 // miplayHooks connect the MiPlay receiver to the arbitration engine. The
 // engine is the single authority on who owns the sound card; the receiver
-// only ever asks.
+// only ever asks. The volume hooks drive the hardware mixer through short
+// timeouts: they run inside the control-session loop, so they must never
+// stall the protocol.
 func miplayHooks(engine *output.Engine, logger *slog.Logger) miplay.Hooks {
+	volumeCtx := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.Background(), 2*time.Second)
+	}
 	return miplay.Hooks{
 		Claim: func() error {
 			if err := engine.Claim(output.SourceMiPlay); err != nil {
@@ -280,49 +271,25 @@ func miplayHooks(engine *output.Engine, logger *slog.Logger) miplay.Hooks {
 			engine.Release(output.SourceMiPlay)
 		},
 		SetVolume: func(percent int) {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ctx, cancel := volumeCtx()
 			defer cancel()
 			if _, err := engine.SetVolume(ctx, percent); err != nil {
-				logger.Warn("could not mirror the miplay volume onto the hardware mixer", "error", err, "volume", percent)
+				// The phone slider must never trigger a reconnect over a failed
+				// write; the session stays alive and the console can retry.
+				logger.Warn("could not mirror the miplay volume onto the hardware mixer",
+					"error", err, "volume", percent)
 			}
 		},
-		// Volume answers the protocol volume paths - the level a new control
-		// session starts from and every GET_VOLUME - from the hardware mixer
-		// the console and DLNA read. Each read re-reads the actual ALSA control
-		// first, so the phone always sees the live level and the slider cannot
-		// spring back to a stale snapshot.
 		Volume: func() (int, bool) {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			ctx, cancel := volumeCtx()
 			defer cancel()
-			engine.RefreshVolume(ctx)
-			return engine.VolumeLevel()
+			percent, _, err := engine.Volume(ctx)
+			if err != nil {
+				return 0, false
+			}
+			return percent, true
 		},
 	}
-}
-
-// mixerControlFor decides whether MPD may use a hardware mixer. The volume
-// authority is the ALSA control the engine's mixer drives (effectiveControl),
-// so MPD must drive that very control: with a different one, MPD's mirror of
-// the level and the actual hardware attenuation would diverge (two controls in
-// series). MPD refuses to start when a configured hardware mixer control does
-// not exist, so an absent control degrades to MPD's software mixer instead of
-// a crash loop.
-func mixerControlFor(report alsa.Report, cfg config.Config, effectiveControl string) string {
-	if effectiveControl != "" {
-		for _, control := range report.ControlNames {
-			if control == effectiveControl {
-				return effectiveControl
-			}
-		}
-	}
-	if strings.TrimSpace(cfg.MPDMixerControl) != "" {
-		for _, control := range report.ControlNames {
-			if control == cfg.MPDMixerControl {
-				return cfg.MPDMixerControl
-			}
-		}
-	}
-	return ""
 }
 
 // runHealthcheck probes the local HTTP API. It is used by the container

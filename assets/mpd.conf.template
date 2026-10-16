@@ -5,14 +5,11 @@
 #
 # 关键约束（沿用实机验证结论）：
 #   · device "hw:0,0"        模拟声卡唯一立体声输出通路（3.5mm 耳机孔 / USB DAC）
+#   · mixer_type "null"      妙播桥不提供音量控制：MPD 忽略 setvol 等音量命令，
+#                             增益固定为满量程，系统的输出幅度由上游播放端决定
 #   · auto_resample "no"     设备原生支持 44.1/48/96/192k，不做重采样，保持 bit-perfect
 #   · 不设置 format          让 MPD 按曲目实际采样率打开设备（设死会强制重采样）
 #   · bind_to_address 127.0.0.1  MPD 控制口只给同容器的自研外壳使用，不对局域网暴露
-#
-# 音量：mixer_type "hardware" + mixer_control 指向与外壳混音器完全相同的
-# 那一个 simple mixer 控件（即 effective control，本机为 Headphone），保证 MPD、
-# 控制台、妙播三方读写同一个控件。若该控件不存在（例如某些 USB DAC），外壳
-# 会自动回退为 software mixer，避免 MPD 因找不到控件而拒绝启动。
 #
 # 注意：妙播实时管线不经 MPD（ffmpeg | aplay 直出），本配置服务 DLNA 投音与
 # REST API 的 URL 播放。
@@ -32,9 +29,6 @@ audio_output {
     type            "alsa"
     name            "妙播桥"
     device          "{{.Device}}"
-{{if .MixerControl}}    mixer_type      "hardware"
-    mixer_device    "{{.MixerDevice}}"
-    mixer_control   "{{.MixerControl}}"
-{{else}}    mixer_type      "software"
-{{end}}    auto_resample   "no"
+    mixer_type      "null"
+    auto_resample   "no"
 }

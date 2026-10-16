@@ -13,9 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/miplay-bridge/miplay-bridge/internal/alsa"
-	"github.com/miplay-bridge/miplay-bridge/internal/alsa/alsatest"
 	"github.com/miplay-bridge/miplay-bridge/internal/config"
+	"github.com/miplay-bridge/miplay-bridge/internal/mix"
 	"github.com/miplay-bridge/miplay-bridge/internal/mpd"
 )
 
@@ -27,7 +26,6 @@ type fakeKernel struct {
 	mu       sync.Mutex
 	commands []string
 	state    string
-	volume   int
 	busy     bool
 }
 
@@ -37,7 +35,7 @@ func newFakeKernel(t *testing.T) *fakeKernel {
 	if err != nil {
 		t.Fatal(err)
 	}
-	kernel := &fakeKernel{listener: listener, state: "stop", volume: 50}
+	kernel := &fakeKernel{listener: listener, state: "stop"}
 	go kernel.serve()
 	t.Cleanup(func() { _ = listener.Close() })
 	return kernel
@@ -72,7 +70,7 @@ func (k *fakeKernel) handle(connection net.Conn) {
 		}
 		k.mu.Lock()
 		k.commands = append(k.commands, line)
-		state, volume, busy := k.state, k.volume, k.busy
+		state, busy := k.state, k.busy
 		k.mu.Unlock()
 
 		if busy {
@@ -83,7 +81,7 @@ func (k *fakeKernel) handle(connection net.Conn) {
 		fields := strings.Fields(line)
 		switch fields[0] {
 		case "status":
-			fmt.Fprintf(connection, "volume: %d\nstate: %s\nelapsed: 3.500\nduration: 210.000\nOK\n", volume, state)
+			fmt.Fprintf(connection, "state: %s\nelapsed: 3.500\nduration: 210.000\nOK\n", state)
 		case "currentsong":
 			fmt.Fprint(connection, "file: http://127.0.0.1:8080/stream/1\nTitle: Test Track\nArtist: Test Artist\nAlbum: Test Album\nduration: 210.000\nOK\n")
 		case "play":
@@ -98,15 +96,6 @@ func (k *fakeKernel) handle(connection net.Conn) {
 			fmt.Fprint(connection, "OK\n")
 		case "stop":
 			k.setState("stop")
-			fmt.Fprint(connection, "OK\n")
-		case "setvol":
-			if len(fields) > 1 {
-				var parsed int
-				_, _ = fmt.Sscanf(fields[1], "%d", &parsed)
-				k.mu.Lock()
-				k.volume = parsed
-				k.mu.Unlock()
-			}
 			fmt.Fprint(connection, "OK\n")
 		case "clear", "add", "seekcur":
 			fmt.Fprint(connection, "OK\n")
@@ -138,8 +127,7 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// testEngine assembles a real engine around a fake kernel and an
-// uninitialised mixer (the mixer hardware path is covered in the alsa tests).
+// testEngine assembles a real engine around a fake kernel.
 func testEngine(t *testing.T, kernel *fakeKernel) *Engine {
 	t.Helper()
 	cfg := config.Default()
@@ -148,7 +136,7 @@ func testEngine(t *testing.T, kernel *fakeKernel) *Engine {
 	cfg.DataDirectory = t.TempDir()
 	logger := testLogger()
 	manager := mpd.NewManager(cfg, logger)
-	return New(cfg, logger, manager, alsa.New(cfg, logger))
+	return New(cfg, logger, manager)
 }
 
 func TestClaimArbitration(t *testing.T) {
@@ -240,7 +228,7 @@ func TestClaimMiPlayToleratesUnreachableKernel(t *testing.T) {
 	cfg.MPDHost = "127.0.0.1"
 	cfg.MPDPort = 1
 	logger := testLogger()
-	engine := New(cfg, logger, mpd.NewManager(cfg, logger), nil)
+	engine := New(cfg, logger, mpd.NewManager(cfg, logger))
 	if err := engine.Claim(SourceMiPlay); err != nil {
 		t.Fatalf("an unreachable kernel must not block the MiPlay claim: %v", err)
 	}
@@ -348,16 +336,13 @@ func TestLoadPropagatesDeviceBusy(t *testing.T) {
 
 func TestEngineWithoutKernelReportsUnavailable(t *testing.T) {
 	logger := testLogger()
-	engine := New(config.Default(), logger, nil, nil)
+	engine := New(config.Default(), logger, nil)
 	ctx := context.Background()
 
 	// The read-only snapshot degrades gracefully.
 	info := engine.Info(ctx)
 	if info.State != "unknown" || info.Error == "" {
 		t.Fatalf("info = %+v", info)
-	}
-	if info.Volume != -1 {
-		t.Fatalf("volume = %d, want -1 without a mixer", info.Volume)
 	}
 	// Every mutating surface refuses with ErrUnavailable.
 	for name, call := range map[string]func() error{
@@ -370,95 +355,6 @@ func TestEngineWithoutKernelReportsUnavailable(t *testing.T) {
 		if err := call(); !errors.Is(err, mpd.ErrUnavailable) {
 			t.Fatalf("%s = %v, want ErrUnavailable", name, err)
 		}
-	}
-}
-
-func TestSetVolumeClampsAndMirrors(t *testing.T) {
-	kernel := newFakeKernel(t)
-	engine := testEngine(t, kernel)
-	ctx := context.Background()
-
-	if level, err := engine.SetVolume(ctx, 150); err != nil || level != 100 {
-		t.Fatalf("SetVolume(150) = %d, %v", level, err)
-	}
-	if level, err := engine.SetVolume(ctx, -5); err != nil || level != 0 {
-		t.Fatalf("SetVolume(-5) = %d, %v", level, err)
-	}
-	if level, err := engine.SetVolume(ctx, 42); err != nil || level != 42 {
-		t.Fatalf("SetVolume(42) = %d, %v", level, err)
-	}
-
-	commands := kernel.recorded()
-	expected := []string{"setvol 100", "setvol 0", "setvol 42"}
-	if len(commands) != len(expected) {
-		t.Fatalf("commands = %v, want %v", commands, expected)
-	}
-	for index, want := range expected {
-		if commands[index] != want {
-			t.Fatalf("commands[%d] = %q, want %q", index, commands[index], want)
-		}
-	}
-}
-
-func TestSetMuteNeedsAnInitialisedMixer(t *testing.T) {
-	kernel := newFakeKernel(t)
-	engine := testEngine(t, kernel)
-
-	if _, err := engine.SetMute(context.Background(), true); err == nil {
-		t.Fatal("mute must fail without an initialised hardware mixer")
-	}
-	if _, ok := engine.Volume(); ok {
-		t.Fatal("an uninitialised mixer must report no switch state")
-	}
-}
-
-// TestVolumeLevelNeedsAnInitialisedMixer pins the protocol-volume gate: with
-// no hardware mixer backing it, VolumeLevel reports unavailable so the MiPlay
-// layer falls back to its own configured default.
-func TestVolumeLevelNeedsAnInitialisedMixer(t *testing.T) {
-	kernel := newFakeKernel(t)
-	engine := testEngine(t, kernel)
-	if level, ok := engine.VolumeLevel(); ok {
-		t.Fatalf("VolumeLevel = %d, %v; want unavailable without an initialised mixer", level, ok)
-	}
-}
-
-// TestVolumeFollowsTheHardwareControl pins the "volume = the hardware control"
-// contract end to end: reads report the control's live state after a refresh,
-// an out-of-band change (a host-side amixer invocation, the kernel's own mixer
-// writes) is picked up, and SetVolume writes the control even without a
-// playback kernel.
-func TestVolumeFollowsTheHardwareControl(t *testing.T) {
-	fake := alsatest.New()
-	cfg := config.Default()
-	logger := testLogger()
-	mixer := alsa.New(cfg, logger).WithRunner(fake.Run)
-	if _, err := mixer.Init(context.Background()); err != nil {
-		t.Fatalf("mixer init: %v", err)
-	}
-
-	// No playback kernel at all: the hardware mixer alone backs the engine.
-	engine := New(cfg, logger, nil, mixer)
-
-	// Init calibrated the effective control to the configured default volume.
-	level, ok := engine.VolumeLevel()
-	if !ok || level != cfg.DefaultVolume {
-		t.Fatalf("VolumeLevel = %d, %v; want the effective control at the init-calibrated %d", level, ok, cfg.DefaultVolume)
-	}
-
-	// An out-of-band change only becomes visible after a refresh.
-	fake.SetPercent("Headphone", 42)
-	engine.RefreshVolume(context.Background())
-	if level, ok = engine.VolumeLevel(); !ok || level != 42 {
-		t.Fatalf("VolumeLevel after refresh = %d, %v; want the control's 42", level, ok)
-	}
-
-	// Writes go to the hardware control even with no kernel to mirror into.
-	if applied, err := engine.SetVolume(context.Background(), 33); err != nil || applied != 33 {
-		t.Fatalf("SetVolume = %d, %v", applied, err)
-	}
-	if got := fake.PercentOf("Headphone"); got != 33 {
-		t.Fatalf("hardware control = %d, want 33", got)
 	}
 }
 
@@ -488,5 +384,113 @@ func TestSuperviseReleasesStoppedKernel(t *testing.T) {
 			t.Fatal("a stopped kernel must release the slot within two monitor ticks")
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// hardware mixer surface
+// ---------------------------------------------------------------------------
+
+// fakeSystemMixer is a scripted SystemMixer that mirrors the mix.Controller
+// contract on a 0-64 raw scale: it clamps the percentage and its reads
+// reflect the last write.
+type fakeSystemMixer struct {
+	percent int
+	muted   bool
+	err     error
+}
+
+func (m *fakeSystemMixer) SystemVolume(context.Context) (mix.SystemState, error) {
+	if m.err != nil {
+		return mix.SystemState{}, m.err
+	}
+	return mix.SystemState{
+		Control:   "Headphone",
+		Raw:       m.percent * 64 / 100,
+		Percent:   m.percent,
+		Muted:     m.muted,
+		HasVolume: true,
+		HasSwitch: true,
+	}, nil
+}
+
+func (m *fakeSystemMixer) SetSystemPercent(_ context.Context, percent int) (mix.SystemState, error) {
+	if m.err != nil {
+		return mix.SystemState{}, m.err
+	}
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	m.percent = percent
+	return m.SystemVolume(context.Background())
+}
+
+func (m *fakeSystemMixer) SetSystemMute(_ context.Context, muted bool) error {
+	if m.err != nil {
+		return m.err
+	}
+	m.muted = muted
+	return nil
+}
+
+func TestEngineVolumeWithoutAMixerDegrades(t *testing.T) {
+	// No kernel and no mixer: every volume surface reports the missing
+	// hardware control instead of crashing or needing MPD.
+	engine := New(config.Default(), testLogger(), nil)
+	ctx := context.Background()
+
+	if _, err := engine.SetVolume(ctx, 50); !errors.Is(err, ErrNoVolumeControl) {
+		t.Fatalf("SetVolume = %v, want ErrNoVolumeControl", err)
+	}
+	if _, err := engine.SetMute(ctx, true); !errors.Is(err, ErrNoVolumeControl) {
+		t.Fatalf("SetMute = %v, want ErrNoVolumeControl", err)
+	}
+	if _, _, err := engine.Volume(ctx); !errors.Is(err, ErrNoVolumeControl) {
+		t.Fatalf("Volume = %v, want ErrNoVolumeControl", err)
+	}
+}
+
+func TestEngineVolumeDrivesTheSystemMixer(t *testing.T) {
+	// Deliberately no kernel: the volume path must never depend on MPD being
+	// reachable (mixer_type "null" keeps the kernel out of volume anyway).
+	engine := New(config.Default(), testLogger(), nil)
+	mixer := &fakeSystemMixer{percent: 42}
+	engine.SetSystemMixer(mixer)
+	ctx := context.Background()
+
+	if percent, muted, err := engine.Volume(ctx); err != nil || percent != 42 || muted {
+		t.Fatalf("Volume = %d/%v/%v, want 42/false", percent, muted, err)
+	}
+	if percent, err := engine.SetVolume(ctx, 33); err != nil || percent != 33 {
+		t.Fatalf("SetVolume(33) = %d, %v", percent, err)
+	}
+	if percent, err := engine.SetVolume(ctx, 150); err != nil || percent != 100 {
+		t.Fatalf("SetVolume(150) = %d, %v, want the clamped 100", percent, err)
+	}
+	if muted, err := engine.SetMute(ctx, true); err != nil || !muted {
+		t.Fatalf("SetMute(true) = %v, %v", muted, err)
+	}
+	if percent, muted, err := engine.Volume(ctx); err != nil || percent != 100 || !muted {
+		t.Fatalf("read-back = %d/%v/%v, want 100/true", percent, muted, err)
+	}
+}
+
+func TestEngineVolumePropagatesMixerFailures(t *testing.T) {
+	engine := New(config.Default(), testLogger(), nil)
+	mixer := &fakeSystemMixer{err: errors.New("amixer exploded")}
+	engine.SetSystemMixer(mixer)
+	ctx := context.Background()
+
+	if _, err := engine.SetVolume(ctx, 50); err == nil || !strings.Contains(err.Error(), "amixer exploded") {
+		t.Fatalf("SetVolume = %v", err)
+	}
+	if _, err := engine.SetMute(ctx, false); err == nil || !strings.Contains(err.Error(), "amixer exploded") {
+		t.Fatalf("SetMute = %v", err)
+	}
+	if _, _, err := engine.Volume(ctx); err == nil || !strings.Contains(err.Error(), "amixer exploded") {
+		t.Fatalf("Volume = %v", err)
 	}
 }

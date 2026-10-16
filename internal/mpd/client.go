@@ -319,18 +319,6 @@ func (c *Client) SeekCur(ctx context.Context, position time.Duration) error {
 	return err
 }
 
-// SetVolume sets the hardware mixer volume (0-100).
-func (c *Client) SetVolume(ctx context.Context, volume int) error {
-	if volume < 0 {
-		volume = 0
-	}
-	if volume > 100 {
-		volume = 100
-	}
-	_, err := c.command(ctx, "setvol", strconv.Itoa(volume))
-	return err
-}
-
 // SetRepeat toggles queue repeat.
 func (c *Client) SetRepeat(ctx context.Context, enabled bool) error {
 	_, err := c.command(ctx, "repeat", boolFlag(enabled))

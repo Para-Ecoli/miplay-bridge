@@ -13,18 +13,6 @@ func TestDefaultMatchesVerifiedHardware(t *testing.T) {
 	if got := cfg.ALSAHardwareDevice(); got != "hw:0,0" {
 		t.Fatalf("ALSAHardwareDevice() = %q, want hw:0,0", got)
 	}
-	if got := cfg.ALSAHardwareCard(); got != "hw:0" {
-		t.Fatalf("ALSAHardwareCard() = %q, want hw:0", got)
-	}
-	if cfg.AutoMuteControl != "Auto-Mute Mode" {
-		t.Fatalf("AutoMuteControl = %q, want Auto-Mute Mode", cfg.AutoMuteControl)
-	}
-	if !cfg.FixAutoMute {
-		t.Fatal("FixAutoMute must default to true: without it the 3.5mm jack stays muted")
-	}
-	if cfg.MPDMixerControl != "Headphone" {
-		t.Fatalf("MPDMixerControl = %q, want Headphone", cfg.MPDMixerControl)
-	}
 	if cfg.SoundDirectory != "/dev/snd" {
 		t.Fatalf("SoundDirectory = %q, want /dev/snd", cfg.SoundDirectory)
 	}
@@ -61,13 +49,24 @@ func TestDefaultCoversReceiverAndRenderer(t *testing.T) {
 	}
 }
 
+func TestDefaultCoversTheHardwareMixer(t *testing.T) {
+	cfg := Default()
+	if cfg.AmixerPath != "amixer" {
+		t.Fatalf("AmixerPath = %q, want the bare binary resolved through PATH", cfg.AmixerPath)
+	}
+	if cfg.VolumeControl != "" {
+		t.Fatalf("VolumeControl = %q, want auto-detection", cfg.VolumeControl)
+	}
+	if cfg.VolumeDefault != 80 {
+		t.Fatalf("VolumeDefault = %d, want 80", cfg.VolumeDefault)
+	}
+}
+
 func TestLoadReadsEnvironment(t *testing.T) {
 	t.Setenv("BRIDGE_PORT", "9001")
 	t.Setenv("BRIDGE_TOKEN", "s3cret")
 	t.Setenv("ALSA_CARD", "2")
 	t.Setenv("ALSA_PCM_DEVICE", "3")
-	t.Setenv("MPD_MIXER_CONTROL", "Master")
-	t.Setenv("ALSA_FIX_AUTO_MUTE", "false")
 	t.Setenv("BRIDGE_TEST_TONE_HZ", "1000")
 	t.Setenv("MIPLAY_CONTROL_PORT", "9987")
 	t.Setenv("MIPLAY_ALSA_BUFFER_US", "350000")
@@ -89,12 +88,6 @@ func TestLoadReadsEnvironment(t *testing.T) {
 	if got := cfg.ALSAHardwareDevice(); got != "hw:2,3" {
 		t.Fatalf("ALSAHardwareDevice() = %q", got)
 	}
-	if cfg.MPDMixerControl != "Master" {
-		t.Fatalf("MPDMixerControl = %q", cfg.MPDMixerControl)
-	}
-	if cfg.FixAutoMute {
-		t.Fatal("ALSA_FIX_AUTO_MUTE=false must disable the fix")
-	}
 	if cfg.TestToneFrequencyHz != 1000 {
 		t.Fatalf("TestToneFrequencyHz = %d", cfg.TestToneFrequencyHz)
 	}
@@ -109,15 +102,34 @@ func TestLoadReadsEnvironment(t *testing.T) {
 	}
 }
 
+func TestLoadReadsMixerEnvironment(t *testing.T) {
+	t.Setenv("AMIXER_PATH", " /opt/alsa/bin/amixer ")
+	t.Setenv("BRIDGE_VOLUME_CONTROL", " Headphone ")
+	t.Setenv("BRIDGE_VOLUME_DEFAULT", "65")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AmixerPath != "/opt/alsa/bin/amixer" {
+		t.Fatalf("AmixerPath = %q", cfg.AmixerPath)
+	}
+	if cfg.VolumeControl != "Headphone" {
+		t.Fatalf("VolumeControl = %q", cfg.VolumeControl)
+	}
+	if cfg.VolumeDefault != 65 {
+		t.Fatalf("VolumeDefault = %d", cfg.VolumeDefault)
+	}
+}
+
 func TestLoadRejectsInvalidValues(t *testing.T) {
 	cases := []struct{ name, value string }{
 		{"BRIDGE_PORT", "70000"},
 		{"MIPLAY_CONTROL_PORT", "0"},
 		{"MIPLAY_ALSA_BUFFER_US", "1"},
 		{"DLNA_SSDP_MAX_AGE", "5"},
-		{"ALSA_DEFAULT_VOLUME", "101"},
-		{"ALSA_FIX_AUTO_MUTE", "maybe"},
 		{"DLNA_ENABLED", "maybe"},
+		{"BRIDGE_VOLUME_DEFAULT", "150"},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {

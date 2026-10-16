@@ -88,22 +88,6 @@
   .btn.danger { border-color: #6b3040; background: #3a1e28; }
   .btn.danger:hover { border-color: var(--err); }
 
-  .mixer-card { grid-column: 1 / -1; }
-  .mixer-panel { display: flex; flex-direction: column; gap: 10px; }
-  .mixer-row { display: grid; grid-template-columns: minmax(88px, 132px) 1fr auto; gap: 8px 12px; align-items: center; }
-  .mixer-row + .mixer-row { border-top: 1px solid var(--line); padding-top: 10px; }
-  .mixer-name { display: flex; flex-direction: column; gap: 1px; font-size: 14px; min-width: 0; }
-  .mixer-name .mixer-main { font-size: 11px; color: var(--accent); }
-  .mixer-control { display: flex; align-items: center; gap: 10px; min-width: 0; }
-  .mixer-control input[type=range] { flex: 1; min-width: 90px; accent-color: var(--accent); }
-  .mixer-value { min-width: 44px; text-align: right; font-weight: 600; font-size: 13px; }
-  .mixer-side { display: flex; align-items: center; gap: 8px; }
-  .mixer-side .btn { padding: 5px 10px; font-size: 13px; }
-  .mixer-side select { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px; font-size: 13px; }
-  .mixer-error { grid-column: 1 / -1; color: var(--err); font-size: 12.5px; }
-  .mixer-error:empty { display: none; }
-  .mixer-empty { color: var(--muted); font-size: 13.5px; }
-
   #action-result {
     margin-top: 16px; padding: 11px 14px; border-radius: 10px; font-size: 14px;
     background: var(--panel); border: 1px solid var(--line); color: var(--muted);
@@ -113,6 +97,38 @@
 
   footer { margin-top: 26px; color: var(--muted); font-size: 12.5px; line-height: 1.8; }
   footer code { background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 0 5px; }
+
+  .card.wide { grid-column: 1 / -1; }
+  .mixer-section { margin-top: 14px; }
+  .mixer-section:first-of-type { margin-top: 2px; }
+  .mixer-title { font-size: 13px; color: var(--accent); font-weight: 600; margin: 0 0 8px; }
+  .mixer-title.capture { color: #93c5fd; }
+  .mixer-title .hint2 { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 6px; }
+  .mixer-panel { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .mixer-panel + .mixer-panel { margin-top: 10px; }
+  .mixer-row { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .mixer-row:last-child { border-bottom: none; }
+  .mixer-label { width: 150px; flex: none; }
+  .mixer-label .name { font-weight: 600; font-size: 13.5px; }
+  .mixer-label .meta { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mixer-body { flex: 1; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; min-width: 240px; }
+  .mixer-slider { flex: 1; min-width: 140px; height: 22px; accent-color: var(--accent); cursor: pointer; margin: 0; }
+  .mixer-val { flex: none; display: flex; gap: 8px; font-size: 12px; font-variant-numeric: tabular-nums; align-items: baseline; }
+  .mixer-val .raw { font-weight: 700; min-width: 2em; text-align: right; }
+  .mixer-val .pct { color: var(--accent); min-width: 3.2em; }
+  .mixer-val .db { color: var(--muted); min-width: 5em; }
+  .mixer-val .db.warn { color: var(--warn); }
+  .mixer-range { color: var(--muted); font-size: 11px; }
+  .mixer-switch { display: inline-flex; align-items: center; cursor: pointer; user-select: none; flex: none; }
+  .mixer-switch input { accent-color: var(--ok); width: 16px; height: 16px; cursor: pointer; }
+  .source-list { display: flex; flex-wrap: wrap; gap: 8px 16px; padding: 10px 12px; }
+  .source-item { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; user-select: none; padding: 3px 9px 3px 6px; border-radius: 8px; border: 1px solid transparent; font-size: 13px; }
+  .source-item:hover { border-color: var(--line); }
+  .source-item input { accent-color: var(--accent); cursor: pointer; }
+  .source-item.active { border-color: var(--accent); }
+  .source-item.active .source-name { color: var(--accent); font-weight: 600; }
+  .mixer-empty { color: var(--muted); padding: 12px; font-size: 13px; }
+  .tag.sync-bad { color: var(--err); border-color: var(--err); }
 </style>
 </head>
 <body>
@@ -152,7 +168,6 @@
       <dl class="kv">
         <dt>连接</dt><dd id="miplay-connected">—</dd>
         <dt>来源设备</dt><dd id="miplay-source">—</dd>
-        <dt>实时音量</dt><dd id="miplay-volume">—</dd>
         <dt>播放状态</dt><dd id="miplay-state">—</dd>
         <dt>媒体信息</dt><dd id="miplay-media">—</dd>
       </dl>
@@ -182,8 +197,6 @@
       <dl class="kv">
         <dt>设备可见</dt><dd id="card-present">—</dd>
         <dt>卡列表</dt><dd id="card-list">—</dd>
-        <dt>Auto-Mute</dt><dd id="card-automute">—</dd>
-        <dt>混音器</dt><dd id="card-mixer">—</dd>
       </dl>
       <div class="actions">
         <button id="btn-test" class="btn">测试声卡（播放测试音）</button>
@@ -201,26 +214,35 @@
     </div>
 
     <div class="card">
-      <h2>音量与总控</h2>
+      <h2>总控</h2>
       <div class="actions">
         <button id="btn-stop-all" class="btn danger">全部停止</button>
       </div>
     </div>
 
-    <div class="card mixer-card">
-      <h2>硬件混音器 <span class="tag">与 alsamixer 播放视图一致</span></h2>
-      <div id="mixer-panel" class="mixer-panel">
-        <div class="mixer-empty">等待混音器数据…</div>
+    <div class="card wide">
+      <h2>硬件混音器 <span class="tag" id="mixer-card-info">—</span> <span class="tag" id="mixer-sync">—</span></h2>
+      <div class="mixer-section">
+        <div class="mixer-title">播放 <span class="hint2">Playback · 对应 alsamixer F3</span></div>
+        <div class="mixer-panel" id="mixer-playback"><div class="mixer-empty">加载中…</div></div>
+      </div>
+      <div class="mixer-section">
+        <div class="mixer-title capture">录音 <span class="hint2">Capture · 对应 alsamixer F4</span></div>
+        <div class="mixer-panel" id="mixer-capture"><div class="mixer-empty">加载中…</div></div>
+        <div class="mixer-panel" id="mixer-source-panel" hidden>
+          <div class="mixer-title" style="padding: 10px 12px 0; margin: 0;">录音来源 <span class="hint2">Capture Source（排他选择）</span></div>
+          <div class="source-list" id="mixer-sources"></div>
+        </div>
       </div>
     </div>
+
   </div>
 
   <div id="action-result">等待操作…</div>
 
   <footer>
     本页每 2 秒轮询 <code>/api/status</code>；所有数据操作均以 <code>x-bridge-token</code> 头鉴权（在容器环境变量 <code>BRIDGE_TOKEN</code> 中设置，未设置则局域网内免鉴权）。
-    音量与静音由「硬件混音器」面板统一调节：妙播、DLNA 与 API 共享同一硬件混音器等级，手机妙播滑条读取的也是该实时音量。
-    「硬件混音器」列出声卡的全部可调控件（与 alsamixer 播放视图一致），逐项可调音量、静音或枚举值；主音量控件即系统音量。
+    硬件混音器面板经 <code>amixer</code> 直接读写本机 ALSA 控件（原始值，统一控制左右声道）：妙播手机滑条与 DLNA 控制端的音量/静音作用于启动日志中绑定的同一系统音量控件，三方实时一致；播放内核保持满量程（mixer_type null），无串联衰减。
     「清除妙播连接」结束手机投送并释放声卡；「清除 DLNA 连接」停止播放、清空队列并结束全部事件订阅；「测试声卡」经播放内核走生产同路径播放 440 Hz 测试音。
   </footer>
 </div>
@@ -230,11 +252,6 @@
   "use strict";
   var token = localStorage.getItem("miplay-bridge-token") || "";
   var busy = false;
-
-  // Hardware mixer panel state: one entry per control row; each row shields
-  // its slider from poll replies until the requested level is confirmed.
-  var mixerRowStates = {};
-  var mixerSignature = null;
 
   var $ = function (id) { return document.getElementById(id); };
 
@@ -306,231 +323,13 @@
     }
   }
 
-  // ------------------------------------------------------------------
-  // Hardware mixer panel: every control the card exposes, adjustable the
-  // way alsamixer's playback view offers it (volume, switch, enum item).
-  // ------------------------------------------------------------------
-
-  function buildMixerPanel(panel, controls, effectiveControl) {
-    panel.textContent = "";
-    mixerRowStates = {};
-    if (!controls.length) {
-      var empty = document.createElement("div");
-      empty.className = "mixer-empty";
-      empty.textContent = "没有可调节的硬件混音器控件（声卡未初始化或仅有采集控件）。";
-      panel.appendChild(empty);
-      return;
-    }
-    controls.forEach(function (entry) {
-      panel.appendChild(buildMixerRow(entry, effectiveControl));
-    });
-  }
-
-  function buildMixerRow(entry, effectiveControl) {
-    var name = entry.name;
-    mixerRowStates[name] = { pending: null, deadline: 0, sending: false, timer: null, muted: !!entry.muted };
-
-    var row = document.createElement("div");
-    row.className = "mixer-row";
-    row.dataset.control = name;
-
-    var nameCell = document.createElement("div");
-    nameCell.className = "mixer-name";
-    var nameText = document.createElement("span");
-    nameText.textContent = name;
-    nameCell.appendChild(nameText);
-    if (name === effectiveControl) {
-      var mainTag = document.createElement("span");
-      mainTag.className = "mixer-main";
-      mainTag.textContent = "主音量";
-      nameCell.appendChild(mainTag);
-    }
-    row.appendChild(nameCell);
-
-    var controlCell = document.createElement("div");
-    controlCell.className = "mixer-control";
-    if (entry.has_volume) {
-      var slider = document.createElement("input");
-      slider.type = "range";
-      slider.min = "0";
-      slider.max = "100";
-      slider.step = "1";
-      slider.value = entry.volume_percent || 0;
-      slider.addEventListener("input", function () {
-        slider.dataset.dragging = "1";
-        var label = controlCell.querySelector(".mixer-value");
-        if (label) { label.textContent = slider.value + " %"; }
-        queueMixerVolume(name, parseInt(slider.value, 10));
-      });
-      slider.addEventListener("change", function () {
-        delete slider.dataset.dragging;
-        var state = mixerRowStates[name];
-        if (state && state.timer !== null) {
-          clearTimeout(state.timer);
-          flushMixerVolume(name);
-        }
-      });
-      controlCell.appendChild(slider);
-      var value = document.createElement("span");
-      value.className = "mixer-value";
-      value.textContent = (entry.volume_percent !== undefined ? entry.volume_percent : slider.value) + " %";
-      controlCell.appendChild(value);
-    }
-    row.appendChild(controlCell);
-
-    var sideCell = document.createElement("div");
-    sideCell.className = "mixer-side";
-    if (entry.has_switch) {
-      var muteButton = document.createElement("button");
-      muteButton.className = "btn mixer-mute";
-      muteButton.textContent = entry.muted ? "取消静音" : "静音";
-      muteButton.addEventListener("click", function () {
-        var state = mixerRowStates[name];
-        sendMixerSetting(name, { muted: !(state && state.muted) }, muteButton);
-      });
-      sideCell.appendChild(muteButton);
-    }
-    if (entry.items && entry.items.length) {
-      var select = document.createElement("select");
-      select.title = "枚举值";
-      entry.items.forEach(function (item) {
-        var option = document.createElement("option");
-        option.value = item;
-        option.textContent = item;
-        select.appendChild(option);
-      });
-      if (entry.item) { select.value = entry.item; }
-      select.addEventListener("change", function () {
-        sendMixerSetting(name, { item: select.value }, select);
-      });
-      sideCell.appendChild(select);
-    }
-    row.appendChild(sideCell);
-
-    var errorNode = document.createElement("div");
-    errorNode.className = "mixer-error";
-    if (entry.error) { errorNode.textContent = "读取失败：" + entry.error; }
-    row.appendChild(errorNode);
-    return row;
-  }
-
-  function findMixerRow(name) {
-    var rows = $("mixer-panel").querySelectorAll(".mixer-row");
-    for (var index = 0; index < rows.length; index += 1) {
-      if (rows[index].dataset.control === name) { return rows[index]; }
-    }
-    return null;
-  }
-
-  function renderMixerControls(controls, effectiveControl) {
-    var panel = $("mixer-panel");
-    if (!panel) { return; }
-    controls = controls || [];
-    var signature = controls.map(function (entry) { return entry.name; }).join("|") + "::" + (effectiveControl || "");
-    if (signature !== mixerSignature) {
-      mixerSignature = signature;
-      buildMixerPanel(panel, controls, effectiveControl);
-    }
-    controls.forEach(function (entry) { updateMixerRow(entry); });
-  }
-
-  function updateMixerRow(entry) {
-    var row = findMixerRow(entry.name);
-    if (!row) { return; }
-    var state = mixerRowStates[entry.name];
-    if (!state) { return; }
-
-    var slider = row.querySelector("input[type=range]");
-    if (slider && entry.has_volume) {
-      if (slider.dataset.dragging) {
-        // Never fight the user's finger.
-      } else if (state.pending !== null && Date.now() < state.deadline) {
-        if (entry.volume_percent === state.pending) {
-          // The mixer confirmed the request: follow the server again.
-          state.pending = null;
-          delete slider.dataset.dragging;
-          slider.value = entry.volume_percent;
-        }
-        // Unconfirmed: keep showing the requested level, not a stale reply.
-      } else {
-        // No request in flight (or it was never confirmed): the server wins.
-        state.pending = null;
-        delete slider.dataset.dragging;
-        if (entry.volume_percent !== undefined) { slider.value = entry.volume_percent; }
-      }
-      var label = row.querySelector(".mixer-value");
-      if (label) { label.textContent = slider.value + " %"; }
-    }
-
-    var muteButton = row.querySelector(".mixer-mute");
-    if (muteButton && entry.has_switch) {
-      state.muted = !!entry.muted;
-      muteButton.textContent = entry.muted ? "取消静音" : "静音";
-    }
-
-    var select = row.querySelector("select");
-    if (select && entry.item && document.activeElement !== select) {
-      select.value = entry.item;
-    }
-
-    var errorNode = row.querySelector(".mixer-error");
-    if (errorNode) { errorNode.textContent = entry.error ? ("读取失败：" + entry.error) : ""; }
-  }
-
-  // queueMixerVolume coalesces a panel slider drag into a trailing 120 ms
-  // throttle, exactly like the main volume bar above.
-  function queueMixerVolume(name, value) {
-    var state = mixerRowStates[name];
-    if (!state) { return; }
-    state.pending = value;
-    state.deadline = Date.now() + 4000;
-    if (state.sending || state.timer !== null) { return; }
-    state.timer = setTimeout(function () { flushMixerVolume(name); }, 120);
-  }
-
-  function flushMixerVolume(name) {
-    var state = mixerRowStates[name];
-    if (!state) { return; }
-    state.timer = null;
-    if (state.pending === null || state.sending) { return; }
-    var value = state.pending;
-    state.sending = true;
-    post("/api/mixer", { name: name, volume: value }).then(function () {
-      state.sending = false;
-      if (state.pending !== value) {
-        // A newer level arrived while the write was in flight.
-        flushMixerVolume(name);
-      }
-    }).catch(function (error) {
-      state.sending = false;
-      state.pending = null;
-      flash("混音器设置失败（" + name + "）：" + error.message, "err");
-    });
-  }
-
-  function sendMixerSetting(name, body, control) {
-    var payload = { name: name };
-    Object.keys(body).forEach(function (key) { payload[key] = body[key]; });
-    if (control) { control.disabled = true; }
-    post("/api/mixer", payload).then(function () {
-      var action = body.muted === true ? "已静音" : body.muted === false ? "已取消静音" : ("已设为 " + body.item);
-      flash("硬件混音器「" + name + "」" + action + "。", "ok");
-    }).catch(function (error) {
-      flash("混音器设置失败（" + name + "）：" + error.message, "err");
-    }).finally(function () {
-      if (control) { control.disabled = false; }
-      poll();
-    });
-  }
-
   function render(payload) {
     if (!payload) { return; }
     setText("text-version", payload.version);
     setText("text-uptime", fmtUptime(payload.uptime_seconds));
 
     var mpd = payload.mpd || {};
-    var mixer = payload.mixer || {};
-    var ready = !!(mpd.running && mixer.initialized);
+    var ready = !!mpd.running;
     $("dot-ready").className = "dot " + (ready ? "ok" : "bad");
     setText("text-ready", ready ? "服务正常" : "服务降级");
 
@@ -548,7 +347,6 @@
     setText("miplay-advertising", miplay.enabled === false ? "已禁用" : (miplay.advertising ? "广播中" : "未广播"));
     setText("miplay-connected", miplay.enabled === false ? "已禁用" : (miplay.connected ? "已连接" : "未连接"));
     setText("miplay-source", miplay.source_name);
-    setText("miplay-volume", miplay.connected ? (miplay.volume + " %") : "");
     setText("miplay-state", miplay.enabled === false ? "" : stateLabel(miplay.state));
     var media = miplay.media_info || {};
     var mediaText = "";
@@ -587,15 +385,11 @@
     setText("card-present", card.present ? "是" : "否");
     var cards = card.cards || [];
     setText("card-list", cards.length ? cards.map(function (c) { return "card " + c.index + " (" + (c.id || c.name || "?") + ")"; }).join("，") : "");
-    setText("card-automute", card.auto_mute_fixed || payload.auto_mute_fixed ? "已修复（已禁用）" : "未修复");
-    setText("card-mixer", mixer.initialized ? ("已初始化 · " + (mixer.volume_percent !== undefined ? mixer.volume_percent + " %" : "") + (mixer.muted ? "（静音）" : "")) : "未初始化");
 
     setText("mpd-running", mpd.running ? "运行中" : "未运行");
     setText("mpd-pid", mpd.pid);
     setText("mpd-restarts", mpd.restarts);
     setText("mpd-error", mpd.last_error);
-
-    renderMixerControls(payload.mixer_controls, mixer.effective_control);
   }
 
   function poll() {
@@ -682,9 +476,300 @@
     }));
   });
 
+  // ------------------------------------------------------------ 硬件混音器面板
+  // 交互逻辑自原独立 webmixer 平移：滑条驱动 ALSA 原始值、拖动立即写入、
+  // 本地操作后 1.5s 内轮询不回写（防回跳）、写响应直接套用（响应即对齐）。
+  var MIX_POLL_MS = 1500;
+  var MIX_GUARD_MS = 1500;
+  var mixRefs = new Map();
+  var mixGuards = new Map();
+  var mixPending = new Map();
+  var mixInflight = new Set();
+  var mixSig = "";
+
+  var mixEls = {
+    info: $("mixer-card-info"),
+    sync: $("mixer-sync"),
+    playback: $("mixer-playback"),
+    capture: $("mixer-capture"),
+    sourcePanel: $("mixer-source-panel"),
+    sources: $("mixer-sources")
+  };
+
+  function mixCap(control, key) { return (control.capabilities || []).indexOf(key) >= 0; }
+  function mixHasPbVolume(c) { return mixCap(c, "pvolume"); }
+  function mixHasPbSwitch(c) { return mixCap(c, "pswitch") || mixCap(c, "pswitch-joined"); }
+  function mixHasCapVolume(c) { return mixCap(c, "cvolume"); }
+  function mixHasCapSwitch(c) { return mixCap(c, "cswitch") || mixCap(c, "cswitch-joined"); }
+  function mixIsExclusive(c) { return mixCap(c, "cswitch-exclusive"); }
+  function mixGuarded(name) { return (mixGuards.get(name) || 0) > Date.now(); }
+  function mixGuard(name) { mixGuards.set(name, Date.now() + MIX_GUARD_MS); }
+
+  function mixEl(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) { node.className = cls; }
+    if (text !== undefined) { node.textContent = text; }
+    return node;
+  }
+
+  function mixSetSync(text, bad) {
+    mixEls.sync.textContent = text;
+    mixEls.sync.className = "tag" + (bad ? " sync-bad" : "");
+  }
+
+  function mixBuildRows(state) {
+    mixRefs.clear();
+    mixEls.playback.innerHTML = "";
+    mixEls.capture.innerHTML = "";
+    mixEls.sources.innerHTML = "";
+    mixSig = state.controls.map(function (c) { return c.name; }).join("|");
+
+    var playbackCount = 0, captureCount = 0, sourceCount = 0;
+    state.controls.forEach(function (control) {
+      if (mixHasPbVolume(control) || mixHasPbSwitch(control)) {
+        playbackCount++;
+        mixEls.playback.appendChild(mixBuildRow(control, "playback"));
+      }
+      if (mixIsExclusive(control)) {
+        // 排他捕获开关 -> 录音来源单选项
+        sourceCount++;
+        mixEls.sources.appendChild(mixBuildSourceItem(control));
+      } else if (mixHasCapVolume(control) || mixHasCapSwitch(control)) {
+        captureCount++;
+        mixEls.capture.appendChild(mixBuildRow(control, "capture"));
+      }
+    });
+
+    if (!playbackCount) { mixEls.playback.appendChild(mixEl("div", "mixer-empty", "该声卡没有播放控件")); }
+    if (!captureCount) { mixEls.capture.appendChild(mixEl("div", "mixer-empty", "该声卡没有录音音量控件")); }
+    mixEls.sourcePanel.hidden = !sourceCount;
+  }
+
+  function mixBuildRow(control, stream) {
+    var row = mixEl("div", "mixer-row");
+    var label = mixEl("div", "mixer-label");
+    label.appendChild(mixEl("div", "name", control.name));
+    label.appendChild(mixEl("div", "meta", (control.capabilities || []).join(" ") || "—"));
+    row.appendChild(label);
+
+    var body = mixEl("div", "mixer-body");
+    var ref = { row: row, slider: null, switchEl: null, stream: stream };
+    mixRefs.set(control.name, ref);
+
+    var wantSwitch = stream === "playback" ? mixHasPbSwitch(control) : mixHasCapSwitch(control);
+    if (wantSwitch) {
+      var sw = mixBuildSwitch(control.name, stream);
+      ref.switchEl = sw.input;
+      body.appendChild(sw.wrap);
+    }
+
+    var limit = stream === "playback" ? control.playbackLimit : control.captureLimit;
+    var infos = control.channels.map(function (ch) { return ch[stream]; })
+      .filter(function (v) { return v && v.hasVolume; });
+    if (limit && infos.length) {
+      // 统一控制：各声道共用一个滑条，写入时广播同一原始值
+      var input = document.createElement("input");
+      input.type = "range";
+      input.className = "mixer-slider";
+      input.min = limit.min; input.max = limit.max; input.step = 1;
+      input.value = infos[0].raw;
+      input.title = "统一控制左右声道 · 范围 " + limit.min + "–" + limit.max + "（ALSA 原始值）";
+      input.addEventListener("pointerdown", function () { mixGuard(control.name); });
+      input.addEventListener("input", function () { mixGuard(control.name); mixOnSliderInput(control.name, ref); });
+      input.addEventListener("change", function () { mixGuard(control.name); mixOnSliderInput(control.name, ref); });
+      body.appendChild(input);
+
+      var val = mixEl("div", "mixer-val");
+      var rawEl = mixEl("span", "raw");
+      var pctEl = mixEl("span", "pct");
+      var dbEl = mixEl("span", "db");
+      val.appendChild(rawEl);
+      val.appendChild(pctEl);
+      val.appendChild(dbEl);
+      body.appendChild(val);
+      body.appendChild(mixEl("span", "mixer-range", limit.min + "–" + limit.max));
+
+      ref.slider = { el: input, rawEl: rawEl, pctEl: pctEl, dbEl: dbEl, min: limit.min, max: limit.max, channelCount: infos.length };
+      mixSetUnifiedText(ref.slider, infos);
+    }
+
+    row.appendChild(body);
+    return row;
+  }
+
+  function mixBuildSwitch(name, stream) {
+    var wrap = mixEl("label", "mixer-switch");
+    var input = document.createElement("input");
+    input.type = "checkbox";
+    wrap.appendChild(input);
+    input.addEventListener("change", function () {
+      mixGuard(name);
+      mixSendSwitch(name, stream, input.checked ? "on" : "off");
+    });
+    return { wrap: wrap, input: input };
+  }
+
+  function mixBuildSourceItem(control) {
+    var wrap = mixEl("label", "source-item");
+    var input = document.createElement("input");
+    input.type = "radio";
+    input.name = "mixer-capture-source";
+    var name = mixEl("span", "source-name", control.name);
+    wrap.appendChild(input);
+    wrap.appendChild(name);
+    input.addEventListener("change", function () {
+      if (!input.checked) { return; }
+      mixGuard(control.name);
+      mixSendSwitch(control.name, "capture", "on");
+    });
+    mixRefs.set(control.name, { sourceItem: wrap, sourceInput: input, stream: "capture" });
+    return wrap;
+  }
+
+  // 声道一致时显示单个值；不一致时并列显示并给出提示。
+  function mixSetUnifiedText(slider, infos) {
+    var first = infos[0].raw;
+    var equal = infos.every(function (v) { return v.raw === first; });
+    if (equal) {
+      slider.rawEl.textContent = String(first);
+      slider.pctEl.textContent = infos[0].percent + "%";
+      slider.dbEl.textContent = infos[0].hasDb ? infos[0].db.toFixed(2) + "dB" : "";
+      slider.dbEl.className = "db";
+      slider.dbEl.title = "";
+    } else {
+      slider.rawEl.textContent = infos.map(function (v) { return v.raw; }).join("/");
+      slider.pctEl.textContent = infos.map(function (v) { return v.percent + "%"; }).join("/");
+      slider.dbEl.textContent = "≠ 声道不一致";
+      slider.dbEl.className = "db warn";
+      slider.dbEl.title = "当前声道数值不同（例如在 alsamixer 中单独调整过）；拖动滑条即可统一。";
+    }
+  }
+
+  function mixOnSliderInput(name, ref) {
+    var slider = ref.slider;
+    var value = Number(slider.el.value);
+    var percent = slider.max > slider.min ? Math.round((value - slider.min) * 100 / (slider.max - slider.min)) : 0;
+    // 立即刷新本地文本，保证拖动跟手
+    slider.rawEl.textContent = String(value);
+    slider.pctEl.textContent = percent + "%";
+    slider.dbEl.textContent = "";
+    slider.dbEl.className = "db";
+    slider.dbEl.title = "";
+    var values = [];
+    for (var i = 0; i < slider.channelCount; i++) { values.push(value); }
+    mixQueueVolume(name, ref.stream, values);
+  }
+
+  function mixApplyState(state, mode) {
+    if (!state) { return; }
+    var signature = (state.controls || []).map(function (c) { return c.name; }).join("|");
+    if (signature !== mixSig) { mixBuildRows(state); }
+
+    var info = state.card || {};
+    mixEls.info.textContent = "card " + (info.card !== undefined ? info.card : "?") + " · " + (info.id || "?") +
+      (info.mixerName ? " · " + info.mixerName : "");
+
+    (state.controls || []).forEach(function (control) {
+      var ref = mixRefs.get(control.name);
+      if (!ref) { return; }
+      var isGuarded = mixGuarded(control.name);
+
+      // 单选项（排他录音来源）
+      if (ref.sourceInput) {
+        var captureValue = control.channels[0] && control.channels[0].capture;
+        var on = !!(captureValue && captureValue.hasSwitch && captureValue.on);
+        if (!(mode === "poll" && isGuarded)) { ref.sourceInput.checked = on; }
+        ref.sourceItem.classList.toggle("active", on);
+        return;
+      }
+
+      if (ref.switchEl) {
+        var switchValue = null;
+        control.channels.forEach(function (ch) {
+          if (!switchValue && ch[ref.stream] && ch[ref.stream].hasSwitch) { switchValue = ch[ref.stream]; }
+        });
+        if (switchValue && !(mode === "poll" && isGuarded)) {
+          ref.switchEl.checked = switchValue.on;
+        }
+      }
+
+      if (ref.slider) {
+        var infos = control.channels.map(function (ch) { return ch[ref.stream]; })
+          .filter(function (v) { return v && v.hasVolume; });
+        if (infos.length && !(mode === "poll" && isGuarded)) {
+          ref.slider.el.value = infos[0].raw;
+          mixSetUnifiedText(ref.slider, infos);
+        }
+      }
+    });
+  }
+
+  // ------------------------------------------------------------ 混音器请求
+  function mixPost(payload) {
+    return api("/api/mixer", { method: "POST", body: JSON.stringify(payload) }).then(function (result) {
+      if (!result.ok) {
+        var message = (result.payload && result.payload.error) ? result.payload.error : ("HTTP " + result.status);
+        if (result.status === 401) { message = "令牌无效或缺失，请先保存令牌。"; }
+        flash("混音器设置失败：" + message, "err");
+        return null;
+      }
+      return (result.payload && result.payload.mixer) || null;
+    }).catch(function (error) {
+      flash("混音器请求失败：" + error.message, "err");
+      return null;
+    });
+  }
+
+  // 同键合并：拖动过程中的新值覆盖待发送值，只有一个请求在途
+  function mixQueueVolume(name, stream, values) {
+    var key = name + "|" + stream;
+    mixPending.set(key, { name: name, stream: stream, volume: values });
+    if (!mixInflight.has(key)) { mixPumpVolume(key); }
+  }
+
+  function mixPumpVolume(key) {
+    var payload = mixPending.get(key);
+    if (!payload) { return; }
+    mixPending.delete(key);
+    mixInflight.add(key);
+    mixSetSync("同步中…", false);
+    mixPost(payload).then(function (state) {
+      if (state) { mixApplyState(state, "set"); }
+    }).finally(function () {
+      mixInflight.delete(key);
+      if (mixPending.has(key)) { mixPumpVolume(key); }
+    });
+  }
+
+  function mixSendSwitch(name, stream, action) {
+    mixSetSync("同步中…", false);
+    mixPost({ name: name, stream: stream, switch: action }).then(function (state) {
+      if (state) { mixApplyState(state, "set"); }
+    });
+  }
+
+  function mixPoll() {
+    api("/api/mixer").then(function (result) {
+      if (!result.ok) {
+        mixSetSync(result.status === 401 ? "需要令牌" : "不可用", true);
+        return;
+      }
+      var state = result.payload && result.payload.mixer;
+      if (!state) { return; }
+      mixApplyState(state, "poll");
+      if (mixInflight.size === 0) {
+        mixSetSync("已同步 " + new Date().toTimeString().slice(0, 8), false);
+      }
+    }).catch(function () {
+      mixSetSync("无法连接", true);
+    });
+  }
+
   $("token-input").value = token;
   poll();
   setInterval(poll, 2000);
+  mixPoll();
+  setInterval(mixPoll, MIX_POLL_MS);
 })();
 </script>
 </body>

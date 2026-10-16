@@ -285,7 +285,15 @@ func (r *Renderer) initialEventBodies(request *http.Request, serviceKey string) 
 		defer r.mu.Unlock()
 		return [][]byte{lastChangePayload(avtEventFragment(r.transportProperties(ctx)))}
 	case "RenderingControl":
-		volume, muted := r.player.Volume()
+		// The event carries the live hardware level (or the fixed full-scale
+		// state when no control is bound) so a controller subscribing right
+		// after a console change renders the true state.
+		ctx, cancel := context.WithTimeout(request.Context(), 3*time.Second)
+		defer cancel()
+		volume, muted, err := r.player.Volume(ctx)
+		if err != nil {
+			volume, muted = 100, false
+		}
 		return [][]byte{lastChangePayload(rcsEventFragment(volume, muted))}
 	case "ConnectionManager":
 		return [][]byte{connectionManagerPayload()}
@@ -527,12 +535,13 @@ func (r *Renderer) handleRenderingControl(w http.ResponseWriter, request *http.R
 	defer cancel()
 	switch action {
 	case "GetVolume":
-		// Re-read the hardware control first: a controller opening its volume
-		// UI must see the live level, not a stale snapshot.
-		r.player.RefreshVolume(ctx)
-		volume, _ := r.player.Volume()
-		if volume < 0 {
-			volume = 0
+		// Live read: a controller opening its volume UI must see the level
+		// the console or the phone set, never a stale snapshot. Without a
+		// bound control the answer stays full scale so the device profile
+		// does not degrade.
+		volume := 100
+		if current, _, err := r.player.Volume(ctx); err == nil {
+			volume = current
 		}
 		writeSOAPResponse(w, renderingControlService, action, []soapArgument{
 			{Name: "CurrentVolume", Value: strconv.Itoa(volume)},
@@ -543,17 +552,23 @@ func (r *Renderer) handleRenderingControl(w http.ResponseWriter, request *http.R
 			writeSOAPFault(w, errInvalidArgs)
 			return
 		}
-		applied, err := r.player.SetVolume(ctx, desired)
-		if err != nil {
+		if _, err := r.player.SetVolume(ctx, desired); err != nil {
+			if errors.Is(err, output.ErrNoVolumeControl) {
+				// No hardware control: acknowledged and ignored so the
+				// controller panel stays usable.
+				writeSOAPResponse(w, renderingControlService, action, nil)
+				return
+			}
 			writeSOAPFault(w, kernelFault(err))
 			return
 		}
-		r.emitRenderingLocked()
-		_ = applied
+		r.emitRendering(ctx)
 		writeSOAPResponse(w, renderingControlService, action, nil)
 	case "GetMute":
-		r.player.RefreshVolume(ctx)
-		_, muted := r.player.Volume()
+		muted := false
+		if _, current, err := r.player.Volume(ctx); err == nil {
+			muted = current
+		}
 		value := "0"
 		if muted {
 			value = "1"
@@ -568,10 +583,14 @@ func (r *Renderer) handleRenderingControl(w http.ResponseWriter, request *http.R
 			return
 		}
 		if _, err := r.player.SetMute(ctx, desired == "1"); err != nil {
+			if errors.Is(err, output.ErrNoVolumeControl) {
+				writeSOAPResponse(w, renderingControlService, action, nil)
+				return
+			}
 			writeSOAPFault(w, kernelFault(err))
 			return
 		}
-		r.emitRenderingLocked()
+		r.emitRendering(ctx)
 		writeSOAPResponse(w, renderingControlService, action, nil)
 	case "ListPresets":
 		writeSOAPResponse(w, renderingControlService, action, []soapArgument{
@@ -668,9 +687,15 @@ func (r *Renderer) emitTransportLocked(ctx context.Context) {
 	r.events.broadcast(lastChangePayload(avtEventFragment(properties)))
 }
 
-// emitRenderingLocked broadcasts the RenderingControl LastChange.
-func (r *Renderer) emitRenderingLocked() {
-	volume, muted := r.player.Volume()
+// emitRendering broadcasts the RenderingControl LastChange with the live
+// hardware level so every subscribed controller follows a console or phone
+// change. A vanished control reports the fixed full-scale state rather than
+// skipping the event, keeping subscribers aligned with GetVolume/GetMute.
+func (r *Renderer) emitRendering(ctx context.Context) {
+	volume, muted, err := r.player.Volume(ctx)
+	if err != nil {
+		volume, muted = 100, false
+	}
 	r.events.broadcast(lastChangePayload(rcsEventFragment(volume, muted)))
 }
 

@@ -4,7 +4,7 @@
 // realtime pipeline (ffmpeg|aplay), the MPD playback kernel serving DLNA and
 // the HTTP API, and the operator console. The engine tracks which source
 // currently owns the card, serialises the hand-offs and exposes one typed
-// playback surface so no caller has to talk to MPD or amixer directly.
+// playback surface so no caller has to talk to MPD directly.
 package output
 
 import (
@@ -17,8 +17,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/miplay-bridge/miplay-bridge/internal/alsa"
 	"github.com/miplay-bridge/miplay-bridge/internal/config"
+	"github.com/miplay-bridge/miplay-bridge/internal/mix"
 	"github.com/miplay-bridge/miplay-bridge/internal/mpd"
 )
 
@@ -39,6 +39,20 @@ const (
 // "transition not available" fault.
 var ErrSourceBusy = errors.New("the sound card is held by another source")
 
+// ErrNoVolumeControl is re-exported from the mixer package so the DLNA layer
+// can degrade to its fixed full-scale answers without importing it.
+var ErrNoVolumeControl = mix.ErrNoVolumeControl
+
+// SystemMixer is the hardware-mixer surface the protocol volume paths drive.
+// *mix.Controller satisfies it structurally; the engine never mirrors the
+// level onto MPD (mixer_type "null"), so the hardware control stays the one
+// volume authority.
+type SystemMixer interface {
+	SystemVolume(ctx context.Context) (mix.SystemState, error)
+	SetSystemPercent(ctx context.Context, percent int) (mix.SystemState, error)
+	SetSystemMute(ctx context.Context, muted bool) error
+}
+
 // PlaybackInfo is the unified playback snapshot.
 type PlaybackInfo struct {
 	// State is the kernel transport state: play, pause, stop or unknown.
@@ -46,9 +60,6 @@ type PlaybackInfo struct {
 	// Elapsed / Duration are seconds of the current track.
 	Elapsed  float64 `json:"elapsed"`
 	Duration float64 `json:"duration"`
-	// Volume is the hardware mixer percentage; Muted its switch state.
-	Volume int  `json:"volume"`
-	Muted  bool `json:"muted"`
 	// URI / Title / Artist / Album describe the current queue entry.
 	URI    string `json:"uri,omitempty"`
 	Title  string `json:"title,omitempty"`
@@ -60,6 +71,8 @@ type PlaybackInfo struct {
 
 // Player is the playback surface the DLNA renderer drives. *Engine implements
 // it; declaring it here also keeps the renderer unit-testable with a fake.
+// The volume methods drive the hardware mixer and never depend on the
+// playback kernel being available.
 type Player interface {
 	ClaimDLNA() error
 	ReleaseDLNA()
@@ -73,10 +86,7 @@ type Player interface {
 	Info(ctx context.Context) PlaybackInfo
 	SetVolume(ctx context.Context, percent int) (int, error)
 	SetMute(ctx context.Context, muted bool) (bool, error)
-	Volume() (int, bool)
-	// RefreshVolume re-reads the hardware control so the next Volume read
-	// reports the control's live state instead of a stale snapshot.
-	RefreshVolume(ctx context.Context)
+	Volume(ctx context.Context) (int, bool, error)
 }
 
 // Engine arbitrates the sound card between the MiPlay pipeline and the MPD
@@ -86,7 +96,9 @@ type Engine struct {
 	logger  *slog.Logger
 	manager *mpd.Manager
 	client  *mpd.Client
-	mixer   *alsa.Mixer
+
+	mixMu sync.RWMutex
+	mixer SystemMixer
 
 	mu     sync.Mutex
 	active Source
@@ -97,7 +109,7 @@ type Engine struct {
 }
 
 // New assembles the engine around an already running playback kernel.
-func New(cfg config.Config, logger *slog.Logger, manager *mpd.Manager, mixer *alsa.Mixer) *Engine {
+func New(cfg config.Config, logger *slog.Logger, manager *mpd.Manager) *Engine {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -105,7 +117,6 @@ func New(cfg config.Config, logger *slog.Logger, manager *mpd.Manager, mixer *al
 		cfg:     cfg,
 		logger:  logger,
 		manager: manager,
-		mixer:   mixer,
 		active:  SourceIdle,
 	}
 	if manager != nil {
@@ -120,6 +131,65 @@ func (e *Engine) Client() *mpd.Client { return e.client }
 
 // Manager exposes the supervised playback kernel for /healthz reporting.
 func (e *Engine) Manager() *mpd.Manager { return e.manager }
+
+// ---------------------------------------------------------------------------
+// Hardware mixer surface
+// ---------------------------------------------------------------------------
+
+// SetSystemMixer wires the hardware mixer the protocol volume paths drive.
+// Called once during startup; safe to read concurrently afterwards.
+func (e *Engine) SetSystemMixer(mixer SystemMixer) {
+	e.mixMu.Lock()
+	e.mixer = mixer
+	e.mixMu.Unlock()
+}
+
+func (e *Engine) systemMixer() SystemMixer {
+	e.mixMu.RLock()
+	defer e.mixMu.RUnlock()
+	return e.mixer
+}
+
+// SetVolume writes the hardware level and reports the value actually in
+// effect. The level is clamped to 0-100. MPD is deliberately not mirrored:
+// under mixer_type "null" nobody reads the kernel volume.
+func (e *Engine) SetVolume(ctx context.Context, percent int) (int, error) {
+	mixer := e.systemMixer()
+	if mixer == nil {
+		return 0, ErrNoVolumeControl
+	}
+	state, err := mixer.SetSystemPercent(ctx, percent)
+	if err != nil {
+		return 0, err
+	}
+	return state.Percent, nil
+}
+
+// SetMute drives the hardware switch and reports the state in effect.
+func (e *Engine) SetMute(ctx context.Context, muted bool) (bool, error) {
+	mixer := e.systemMixer()
+	if mixer == nil {
+		return false, ErrNoVolumeControl
+	}
+	if err := mixer.SetSystemMute(ctx, muted); err != nil {
+		return false, err
+	}
+	return muted, nil
+}
+
+// Volume reads the live hardware level and mute state; nothing is cached so
+// a console change is visible to the next protocol read immediately.
+func (e *Engine) Volume(ctx context.Context) (int, bool, error) {
+	mixer := e.systemMixer()
+	if mixer == nil {
+		return 0, false, ErrNoVolumeControl
+	}
+	state, err := mixer.SystemVolume(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	return state.Percent, state.Muted, nil
+}
 
 // ---------------------------------------------------------------------------
 // Arbitration
@@ -253,12 +323,7 @@ func (e *Engine) Seek(ctx context.Context, seconds float64) error {
 // Info reads one unified playback snapshot. Failures are reported inside the
 // struct so polling callers never need error branches for cosmetic reads.
 func (e *Engine) Info(ctx context.Context) PlaybackInfo {
-	info := PlaybackInfo{State: "unknown", Volume: -1}
-	if e.mixer != nil {
-		state := e.mixer.State()
-		info.Volume = state.VolumePercent
-		info.Muted = state.Muted
-	}
+	info := PlaybackInfo{State: "unknown"}
 	if e.client == nil {
 		info.Error = "playback kernel is unavailable"
 		return info
@@ -281,83 +346,6 @@ func (e *Engine) Info(ctx context.Context) PlaybackInfo {
 		}
 	}
 	return info
-}
-
-// SetVolume writes the hardware mixer (the volume authority shared by
-// MiPlay, DLNA and the API) and mirrors the level into the kernel so MPD's
-// cached volume does not drift.
-func (e *Engine) SetVolume(ctx context.Context, percent int) (int, error) {
-	if percent < 0 {
-		percent = 0
-	}
-	if percent > 100 {
-		percent = 100
-	}
-	if e.mixer != nil && e.mixer.State().Initialized {
-		state, err := e.mixer.SetVolume(ctx, percent)
-		if err != nil {
-			return state.VolumePercent, err
-		}
-		if e.client != nil {
-			if err := e.client.SetVolume(ctx, percent); err != nil {
-				e.logger.Debug("could not mirror the volume into the playback kernel", "error", err)
-			}
-		}
-		return state.VolumePercent, nil
-	}
-	if e.client == nil {
-		return 0, mpd.ErrUnavailable
-	}
-	if err := e.client.SetVolume(ctx, percent); err != nil {
-		return 0, err
-	}
-	return percent, nil
-}
-
-// SetMute flips the hardware switch of the effective control.
-func (e *Engine) SetMute(ctx context.Context, muted bool) (bool, error) {
-	if e.mixer == nil || !e.mixer.State().Initialized {
-		return false, errors.New("no hardware mixer is available to mute")
-	}
-	state, err := e.mixer.SetMute(ctx, muted)
-	if err != nil {
-		return state.Muted, err
-	}
-	return state.Muted, nil
-}
-
-// Volume reports the mixer level and switch state.
-func (e *Engine) Volume() (int, bool) {
-	if e.mixer == nil {
-		return 0, false
-	}
-	state := e.mixer.State()
-	return state.VolumePercent, state.Muted
-}
-
-// VolumeLevel reports the cached hardware mixer percentage and whether an
-// initialised mixer backs it. The MiPlay protocol volume reads through this:
-// new control sessions start from this level and GET_VOLUME answers it, so
-// the phone's slider follows the real mixer instead of the configured
-// default. Callers refresh the mixer first when they need the control's live
-// state.
-func (e *Engine) VolumeLevel() (int, bool) {
-	if e.mixer == nil || !e.mixer.State().Initialized {
-		return 0, false
-	}
-	return e.mixer.State().VolumePercent, true
-}
-
-// RefreshVolume re-reads the hardware mixer so every read surface (the
-// console status poll, the MiPlay protocol, DLNA GetVolume) reports the
-// control's true state rather than a stale snapshot.
-func (e *Engine) RefreshVolume(ctx context.Context) {
-	if e.mixer == nil {
-		return
-	}
-	if _, err := e.mixer.Refresh(ctx); err != nil {
-		e.logger.Debug("could not refresh the mixer snapshot", "error", err)
-	}
 }
 
 // Supervise watches for a kernel that stopped on its own (natural end of a

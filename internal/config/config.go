@@ -2,9 +2,9 @@
 // environment.
 //
 // Every knob has a working default that matches the verified target machine
-// (card 0 / PCM device 0 / Headphone mixer control) so the container starts
-// with no environment at all. The defaults are documented in README.md and are
-// kept stable so an operator gets the same behaviour across deployments.
+// (card 0 / PCM device 0) so the container starts with no environment at all.
+// The defaults are documented in README.md and are kept stable so an operator
+// gets the same behaviour across deployments.
 package config
 
 import (
@@ -40,25 +40,16 @@ type Config struct {
 	Card int
 	// PCMDevice is the ALSA PCM device index on that card. Default 0.
 	PCMDevice int
-
-	// AutoMuteControl is the HD-Audio simple mixer control that silently mutes
-	// both output pins when left at its factory default. Disabling it is the
-	// single most important step of the whole feature.
-	AutoMuteControl string
-	// AutoMuteDisabledValue is written to AutoMuteControl on startup.
-	AutoMuteDisabledValue string
-	// MasterControl / HeadphoneControl / SpeakerControl are unmuted on startup.
-	MasterControl    string
-	HeadphoneControl string
-	SpeakerControl   string
-	// DefaultVolume is applied to the master control on startup (percent).
-	DefaultVolume int
-	// FixAutoMute can be turned off for exotic sound cards that reject the
-	// control. Default true: the fix is mandatory on the verified hardware.
-	FixAutoMute bool
-
-	// AmixerPath is the alsa-utils binary used for every mixer operation.
+	// AmixerPath is the amixer binary of the hardware mixer console. It ships
+	// with alsa-utils inside the container (which also provides aplay).
 	AmixerPath string
+	// VolumeControl pins the ALSA control the MiPlay and DLNA protocol volume
+	// paths drive. Empty auto-detects the well-known playback control; the
+	// console panel is not affected and still regulates every control.
+	VolumeControl string
+	// VolumeDefault is the fallback level (0-100) a MiPlay control session
+	// starts from when the hardware mixer cannot be read.
+	VolumeDefault int
 
 	// MPDBinary / MPDConfPath / MPDTemplatePath drive the playback kernel.
 	MPDBinary       string
@@ -72,8 +63,6 @@ type Config struct {
 	MPDMusicDirectory string
 	// MPDDataDirectory holds tag_cache/state/playlists.
 	MPDDataDirectory string
-	// MPDMixerControl is the hardware mixer control MPD drives for volume.
-	MPDMixerControl string
 	// MPDStartTimeout bounds how long we wait for MPD to accept connections.
 	MPDStartTimeout time.Duration
 	// MPDMaxRestarts bounds automatic restarts of the playback kernel.
@@ -138,16 +127,8 @@ func Default() Config {
 		SoundDirectory: "/dev/snd",
 		Card:           0,
 		PCMDevice:      0,
-
-		AutoMuteControl:       "Auto-Mute Mode",
-		AutoMuteDisabledValue: "Disabled",
-		MasterControl:         "Master",
-		HeadphoneControl:      "Headphone",
-		SpeakerControl:        "Speaker",
-		DefaultVolume:         80,
-		FixAutoMute:           true,
-
-		AmixerPath: "amixer",
+		AmixerPath:     "amixer",
+		VolumeDefault:  80,
 
 		MPDBinary:         "mpd",
 		MPDConfPath:       "/etc/mpd.conf",
@@ -156,7 +137,6 @@ func Default() Config {
 		MPDPort:           6600,
 		MPDMusicDirectory: "/music",
 		MPDDataDirectory:  "/var/lib/mpd",
-		MPDMixerControl:   "Headphone",
 		MPDStartTimeout:   20 * time.Second,
 		MPDMaxRestarts:    5,
 
@@ -204,26 +184,12 @@ func Load() (Config, error) {
 	if err := parseIntEnv("ALSA_PCM_DEVICE", &cfg.PCMDevice, 0, 32); err != nil {
 		return cfg, err
 	}
-	if v := strings.TrimSpace(os.Getenv("ALSA_AUTO_MUTE_CONTROL")); v != "" {
-		cfg.AutoMuteControl = v
-	}
-	if v := strings.TrimSpace(os.Getenv("ALSA_MASTER_CONTROL")); v != "" {
-		cfg.MasterControl = v
-	}
-	if v := strings.TrimSpace(os.Getenv("ALSA_HEADPHONE_CONTROL")); v != "" {
-		cfg.HeadphoneControl = v
-	}
-	if v := strings.TrimSpace(os.Getenv("ALSA_SPEAKER_CONTROL")); v != "" {
-		cfg.SpeakerControl = v
-	}
-	if err := parseIntEnv("ALSA_DEFAULT_VOLUME", &cfg.DefaultVolume, 0, 100); err != nil {
-		return cfg, err
-	}
-	if err := parseBoolEnv("ALSA_FIX_AUTO_MUTE", &cfg.FixAutoMute); err != nil {
-		return cfg, err
-	}
 	if v := strings.TrimSpace(os.Getenv("AMIXER_PATH")); v != "" {
 		cfg.AmixerPath = v
+	}
+	cfg.VolumeControl = strings.TrimSpace(os.Getenv("BRIDGE_VOLUME_CONTROL"))
+	if err := parseIntEnv("BRIDGE_VOLUME_DEFAULT", &cfg.VolumeDefault, 0, 100); err != nil {
+		return cfg, err
 	}
 
 	if v := strings.TrimSpace(os.Getenv("MPD_BINARY")); v != "" {
@@ -246,9 +212,6 @@ func Load() (Config, error) {
 	}
 	if v := strings.TrimSpace(os.Getenv("MPD_DATA_DIRECTORY")); v != "" {
 		cfg.MPDDataDirectory = v
-	}
-	if v := strings.TrimSpace(os.Getenv("MPD_MIXER_CONTROL")); v != "" {
-		cfg.MPDMixerControl = v
 	}
 	if err := parseIntEnv("MPD_MAX_RESTARTS", &cfg.MPDMaxRestarts, 0, 100); err != nil {
 		return cfg, err
@@ -360,11 +323,6 @@ func (c Config) MPDAddress() string {
 // ALSAHardwareDevice is the exclusive ALSA PCM name, e.g. "hw:0,0".
 func (c Config) ALSAHardwareDevice() string {
 	return fmt.Sprintf("hw:%d,%d", c.Card, c.PCMDevice)
-}
-
-// ALSAHardwareCard is the exclusive ALSA card name, e.g. "hw:0".
-func (c Config) ALSAHardwareCard() string {
-	return fmt.Sprintf("hw:%d", c.Card)
 }
 
 // ControlDevicePath is the ALSA control node for the configured card.

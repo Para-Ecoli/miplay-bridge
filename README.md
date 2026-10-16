@@ -19,17 +19,16 @@
 - **小米妙播原生接收**：完整实现米连（mi-connect）私有协议栈——mDNS 发现应答、TCP 8899 二进制控制通道、挑战应答鉴权、现代 MIUI 的 Safety 加密通道（AES-128-CBC 状态化）、反向 WFD（Wi-Fi Display）RTSP 协商与 RTP/MPEG-TS 媒体接收。手机在「妙播」设备列表中直接看到本机，点击即投。
 - **DLNA / UPnP 标准渲染器**：SSDP 发现、SOAP 控制（AVTransport / RenderingControl / ConnectionManager）、GENA 事件订阅全实现。任何支持 DLNA 投音的手机、电脑或 App 均可投送，`FLAC/WAV` 等格式可位完美（bit-perfect）输出。
 - **双引擎 + 声卡仲裁**：妙播实时流走 `ffmpeg → aplay` 低延迟管线；DLNA 与 HTTP API 走 MPD 播放内核（位置/拖动/元数据能力完备）。二者共用同一块独占声卡（无 dmix），当前音源持有声卡，冲突请求返回 `409 device_busy`——不会出现两个音源互相争抢爆音。
-- **一键清理与内嵌控制台**：内置网页控制台（`http://NAS_IP:8092`），一键「清除妙播连接」「清除 DLNA 连接」「测试声卡」，实时显示声卡/混音器/内核/双协议状态。
-- **硬件自动就绪**：启动自检强制修复 `Auto-Mute Mode` 静音陷阱（ALC269VB 等编解码器的出厂默认会静默静音两个输出口），完成 Master/Headphone 解静音与硬件音量校准，失败拒绝启动——避免“接口全绿但没声音”。
-- **音量唯一直连硬件**：音量唯一权威是 ALSA 硬件混音器控件——控制台混音器面板、妙播手机端、DLNA 控制端读写的都是同一个控件；读路径每次实时对表（无缓存滞后），写路径直写控件并同步内核镜像，避免多控件串联衰减与数值漂移。
-- **全部混音器控件可调**：控制台「硬件混音器」面板与 `alsamixer` 播放视图一致——列出声卡全部可调控件（音量/开关/枚举），逐项可调；前端音量与静音统一由此面板负责，主音量控件即系统音量。
+- **一键清理与内嵌控制台**：内置网页控制台（`http://NAS_IP:8092`），一键「清除妙播连接」「清除 DLNA 连接」「测试声卡」，实时显示声卡/内核/双协议状态，并内置「硬件混音器」面板（控件级音量 / 静音 / 录音来源）。
+- **硬件就绪探测**：启动自检核实 `/dev/snd` 设备节点与所选声卡（`ALSA_CARD` / `ALSA_PCM_DEVICE`）是否可用，缺失时以退出码 `3` 拒绝启动——避免“服务表示健康但声卡不可用”的隐性故障。
+- **硬件混音器 + 协议音量**：控制台内置「硬件混音器」面板（对齐 alsamixer F3/F4，经容器内 `amixer` 直读直写 ALSA 控件）；手机妙播滑条与 DLNA RenderingControl 的音量/静音实时作用于同一 designated 系统音量控件（默认自动探测，`BRIDGE_VOLUME_CONTROL` 可指定）。MPD 内核保持 `mixer_type null` 满量程——单控件单刻度，结构上排除多控件串联衰减。
 - **全平台 Docker 原生支持**：镜像由仓库内 Dockerfile 本地多阶段构建（纯 Go 静态二进制 + Alpine 运行层），不锁定架构，`linux/amd64`、`linux/arm64` 等 Docker 宿主均可直接构建运行，覆盖飞牛 fnOS、群晖 DSM、铁威马 TOS、威联通 QNAP、绿联 UGnas 及一切支持 Docker 的环境。
 
 ---
 
 ## 功能简介
 
-- **手机投歌，音箱发声**：小米手机控制中心「妙播」一键投送至 NAS 物理音箱；支持播放/暂停/恢复/关闭/音量联动，手机端音量与硬件混音器全量对齐。
+- **手机投歌，音箱发声**：小米手机控制中心「妙播」一键投送至 NAS 物理音箱；支持播放/暂停/恢复/关闭，手机端音量滑条与 DLNA 控制端的音量/静音实时写入宿主声卡的硬件混音器控件，与控制台面板保持同源一致。
 - **DLNA 全兼容**：Windows「投放」、各类音乐 App 的 DLNA 投音均可识别本机；支持 Seek 拖动、元数据（标题/艺术家/专辑）展示与传输状态事件推送。
 - **HTTP API 与健康探测**：提供一套稳定的 REST API、测试播放路由（`/api/test-play`）与健康检查端点（`/healthz`），便于外部面板或运维脚本接入。
 - **轻量常驻**：纯 Go 外壳 + 独立 MPD/ffmpeg 进程，内存上限 256MB，CPU 占用接近于 0。
@@ -42,8 +41,8 @@
 小米手机（妙播）── mDNS 发现 + TCP8899 控制 + 反向 WFD(RTSP/RTP-TCP/MPEG-TS)
                                                       └─ ffmpeg 解码 → aplay ──┐
 手机/电脑（DLNA 投音）── SSDP + SOAP + GENA ─ MPD（HTTP URL 拉流播放）─────────┼─▶ ALSA hw:X,Y 直出（独占）
-浏览器 / 控制端 / 运维 ── HTTP API (8092) ─ 状态 / 音量 / 断连 / 声卡测试 ─────┘
-    └─ 内嵌控制台（GET /）：一键清除妙播连接、一键清除 DLNA 连接、一键声卡测试
+浏览器 / 控制端 / 运维 ── HTTP API (8092) ─ 状态 / 断连 / 声卡测试 / 硬件混音器 ─┘
+    └─ 内嵌控制台（GET /）：一键清除妙播连接、一键清除 DLNA 连接、一键声卡测试、硬件混音器面板
 ```
 
 > [!NOTE]
@@ -94,7 +93,6 @@ services:
       BRIDGE_PORT: "8092"
       ALSA_CARD: "0"                # 声卡编号（cat /proc/asound/cards）
       ALSA_PCM_DEVICE: "0"
-      MPD_MIXER_CONTROL: "Headphone" # 仅作回退；优先与桥混音器同控件，避免双重衰减
       MIPLAY_ENABLED: "true"
       MIPLAY_NAME: "妙播桥"
       DLNA_ENABLED: "true"
@@ -137,23 +135,23 @@ curl http://127.0.0.1:8092/healthz
 
 1. 确保手机与本机处于**同一局域网**（同一 Vlan / 未开启 AP 隔离），且宿主防火墙放行 `5353/udp` 与 `8899/tcp`；
 2. 手机端打开「妙播」（控制中心 → 妙播，或系统设置内），在设备列表中选择 `妙播桥`；
-3. 选择要投送的音频后即开始播放，手机端可暂停/恢复/调节音量，NAS 声卡实时出声。
+3. 选择要投送的音频后即开始播放，手机端可暂停/恢复；手机音量滑条实时写入宿主声卡的硬件混音器控件（与控制台面板、DLNA 控制端同源一致）。
 
 > 设备名称由 `MIPLAY_NAME` 控制；修改后需重启容器，手机端可能需下拉刷新设备列表。
 
 ### 2. DLNA 投音
 
 1. 手机 / 电脑上的任意 DLNA 投音入口（如系统「投放」、支持 DLNA 的音乐 App）中选择 `妙播桥`；
-2. 支持播放 / 暂停 / 停止 / 拖动进度 / 音量 / 静音，曲目标题与艺术家会显示在控制台。
+2. 支持播放 / 暂停 / 停止 / 拖动进度，曲目标题与艺术家会显示在控制台；RenderingControl 的 `GetVolume/SetVolume/GetMute/SetMute` 实时读写硬件混音器绑定的系统音量控件，并把变更经 GENA LastChange 推送给订阅的控制端；未探测到可用控件时降级为满量程应答（`100/0`）。
 
 ### 3. 内嵌控制台（`http://NAS_IP:8092`）
 
-- **状态卡片**：服务与版本、声卡（编号 / 选中设备 `hw:X,Y` / Auto-Mute 修复态）、MPD 内核、当前音源（`miplay | dlna | api | idle`）、妙播（广播中 / 已连接 / 来源设备名）与 DLNA（友好名 / 订阅数 / 传输态 / 当前曲目）；
+- **状态卡片**：服务与版本、声卡（编号 / 选中设备 `hw:X,Y`）、MPD 内核、当前音源（`miplay | dlna | api | idle`）、妙播（广播中 / 已连接 / 来源设备名）与 DLNA（友好名 / 订阅数 / 传输态 / 当前曲目）；
 - **一键清除妙播连接** → `POST /api/miplay/disconnect`：关闭控制会话与反向 WFD 连接、终止实时管线、释放声卡；
 - **一键清除 DLNA 连接** → `POST /api/dlna/disconnect`：停止播放、清空队列与元数据、向订阅者推送 STOPPED 并释放全部事件订阅；
 - **测试声卡** → `POST /api/test-play`：经 MPD 走生产同路径播放 440Hz 测试音（默认 2 秒）；
 - 「全部停止」按钮：一键终止妙播投递、DLNA 播放与播放内核并释放声卡；
-- **硬件混音器面板**：列出声卡全部可调控件（与 `alsamixer` 播放视图一致），逐项支持音量滑条、静音开关与枚举选择；前端音量与静音统一由此面板负责，主音量控件即系统音量；
+- **硬件混音器面板** → `GET/POST /api/mixer`：经容器内 `amixer` 直读直写 `ALSA_CARD` 声卡的控件（播放视图对齐 alsamixer F3、录音视图对齐 F4、排他录音来源单选）；滑条驱动 ALSA 原始值、拖动立即写入，本地操作后 1.5 秒内轮询不回写（防回跳），面板每 1.5 秒与 `amixer` 状态自动同步；
 - 设置了 `BRIDGE_TOKEN` 时，页面提供 token 输入（保存在浏览器 localStorage，经 `x-bridge-token` 头调用）。
 
 ### 4. HTTP API 速查
@@ -161,13 +159,13 @@ curl http://127.0.0.1:8092/healthz
 | 方法 | 路径 | 说明 |
 | :--- | :--- | :--- |
 | GET | `/healthz`、`/api/healthz` | 健康探测（免鉴权，容器 healthcheck 使用） |
-| GET | `/api/status` | 全量状态：声卡/混音器（含 `mixer_controls` 全控件快照）/内核/playback/`active_source`/`miplay`/`dlna` |
+| GET | `/api/status` | 全量状态：声卡/内核/playback/`active_source`/`miplay`/`dlna` |
 | GET | `/api/devices` | 声卡列表与当前选择 |
-| POST | `/api/play` | 播放 URL：`{"url": "http://...", "title": "...", "artist": "...", "album": "...", "volume": 60, "position": 30, "start_paused": false}` |
+| POST | `/api/play` | 播放 URL：`{"url": "http://...", "title": "...", "artist": "...", "album": "...", "position": 30, "start_paused": false}` |
 | POST | `/api/control` | 动作：`play / pause / resume / toggle / stop / stop_all / next / prev / seek / repeat / random / single / consume`（别名 `unpause`、`previous`、`shuffle`；`stop_all` 同时清除妙播与 DLNA 会话） |
-| POST | `/api/volume` | `{"volume": 60}` 或 `{"mute": true}` |
-| POST | `/api/mixer` | 调整任意硬件混音器控件：`{"name": "Headphone", "volume": 60}`、`{"name": "Speaker", "muted": true}` 或 `{"name": "Auto-Mute Mode", "item": "Disabled"}`（主音量控件的音量/开关经引擎，同步内核镜像） |
 | POST | `/api/test-play` | 一键声卡测试音 |
+| GET | `/api/mixer` | 硬件混音器全量状态：声卡信息 + 全部 ALSA 控件（raw / percent / dB / 开关 / 范围） |
+| POST | `/api/mixer` | 写控件：`{"name":"Headphone","stream":"playback","volume":[42]}` 或 `{"name":"Headphone","stream":"playback","switch":"on"}`（`switch` 取 `on / off / toggle`，`volume` 为 1 个或 N 个 ALSA 原始值）；响应携带写后完整快照 |
 | POST | `/api/miplay/disconnect` | 一键清除妙播连接（幂等，返回 `was_connected`） |
 | POST | `/api/dlna/disconnect` | 一键清除 DLNA 连接（幂等，返回 `was_active`） |
 | GET | `/tone/{token}/tone.wav` | 测试音内部服务路径（短时效 token，供 MPD 回环拉取） |
@@ -181,6 +179,8 @@ curl -X POST http://127.0.0.1:8092/api/test-play
 curl -X POST http://127.0.0.1:8092/api/miplay/disconnect
 curl -X POST http://127.0.0.1:8092/api/dlna/disconnect
 curl http://127.0.0.1:8092/api/status | head -c 800
+curl http://127.0.0.1:8092/api/mixer | head -c 800
+curl -X POST http://127.0.0.1:8092/api/mixer -d '{"name":"Headphone","stream":"playback","volume":[42]}'
 ```
 
 ---
@@ -201,7 +201,8 @@ cat /proc/asound/cards
 ```
 
 若需使用声卡 1（USB DAC），在环境变量中设置 `ALSA_CARD=1` 并重启服务即可；`ALSA_PCM_DEVICE` 对应设备号码，默认为 `0`。
-容器内**不读取 `/proc/asound`**（容器环境中不可见），自检完全走 `/dev/snd` 与 ALSA control API（`amixer`）。
+容器内**不读取 `/proc/asound`**（容器环境中不可见），自检完全走 `/dev/snd` 设备节点探测。
+控制台硬件混音器面板与协议音量（妙播滑条 / DLNA RenderingControl）经容器内 `amixer -c ${ALSA_CARD}` 读写该声卡控件；首次使用前建议在宿主 `alsamixer` 确认无静音陷阱。
 
 ### 延迟调节（妙播实时管线）
 
@@ -226,20 +227,17 @@ cat /proc/asound/cards
 | `BRIDGE_TEST_TONE_SECONDS` | `2` | 测试音时长（1~30 秒） |
 | `BRIDGE_TEST_TONE_HZ` | `440` | 测试音频率（20~20000 Hz） |
 | `ALSA_SOUND_DIRECTORY` | `/dev/snd` | ALSA 设备节点目录 |
-| `ALSA_CARD` | `0` | 声卡编号 |
+| `ALSA_CARD` | `0` | 声卡编号（硬件混音器面板与协议音量均作用于该卡） |
 | `ALSA_PCM_DEVICE` | `0` | PCM 设备号 |
-| `ALSA_DEFAULT_VOLUME` | `80` | 启动时应用的硬件音量（0~100） |
-| `ALSA_FIX_AUTO_MUTE` | `true` | 启动强制关闭 Auto-Mute 静音陷阱 |
-| `ALSA_AUTO_MUTE_CONTROL` | `Auto-Mute Mode` | Auto-Mute 控制名 |
-| `ALSA_MASTER_CONTROL` / `ALSA_HEADPHONE_CONTROL` / `ALSA_SPEAKER_CONTROL` | `Master` / `Headphone` / `Speaker` | 启动解静音的控制名 |
-| `AMIXER_PATH` | `amixer` | alsa-utils 混音器路径 |
+| `AMIXER_PATH` | `amixer` | `amixer` 二进制路径（容器内由 `alsa-utils` 提供） |
+| `BRIDGE_VOLUME_CONTROL` | 空 | 协议音量绑定的 ALSA 控件名；空 = 自动探测（`Headphone` → `Master` → `Speaker` → `PCM` → … → 首个可用控件） |
+| `BRIDGE_VOLUME_DEFAULT` | `80` | 未探测到可用音量控件时妙播会话的默认音量（0~100） |
 | `MPD_BINARY` | `mpd` | 播放内核路径 |
 | `MPD_CONF_PATH` | `/etc/mpd.conf` | 渲染后的 MPD 配置路径 |
 | `MPD_TEMPLATE_PATH` | `/etc/miplay-bridge/mpd.conf.template` | MPD 配置模板路径 |
 | `MPD_HOST` / `MPD_PORT` | `127.0.0.1:6600` | 内核回环控制地址（不对局域网暴露） |
 | `MPD_MUSIC_DIRECTORY` | `/music` | MPD 曲库目录（只读挂载） |
 | `MPD_DATA_DIRECTORY` | `/var/lib/mpd` | MPD 数据目录 |
-| `MPD_MIXER_CONTROL` | `Headphone` | 回退用 MPD 硬件混音器控制名；优先与桥混音器实际使用的控件（effective control）保持一致，避免双重衰减；不存在时自动降级软件混音 |
 | `MPD_START_TIMEOUT_SECONDS` | `20` | 内核启动等待上限 |
 | `MPD_MAX_RESTARTS` | `5` | 内核自动重启次数上限 |
 | `MPD_LOG_FILE` | 空 | MPD 日志文件路径；为空时随容器日志输出（stderr） |
@@ -275,10 +273,9 @@ cat /proc/asound/cards
 
 按顺序排查：
 
-1. 控制台「测试声卡」是否出声？不出声先检查音箱接线与宿主声卡选择（`ALSA_CARD`）；
-2. 看状态里的 `auto_mute_fixed` 是否为 `true`；为 `false` 时说明 Auto-Mute 未修复成功，多为控制名不匹配（宿主执行 `amixer -c 0 scontrols` 对照设置 `ALSA_AUTO_MUTE_CONTROL`）；
-3. 查看 `docker compose logs` 是否有 mixer 告警；
-4. 妙播链路额外确认 `MIPLAY_ADVERTISE_ADDRESS` 与 Safety 密钥相关报错。
+1. 先看控制台「硬件混音器」面板：确认绑定控件未被静音、音量非零（面板可直接调整）；宿主 `alsamixer` 中部分编解码器的 `Auto-Mute Mode` 出厂默认会静默静音输出口，需手动设为 `Disabled`；
+2. 控制台「测试声卡」是否出声？不出声再检查音箱接线与宿主声卡选择（`ALSA_CARD`）；
+3. 妙播链路额外确认 `MIPLAY_ADVERTISE_ADDRESS` 与 Safety 密钥相关报错。
 
 **Q4：接口返回 `409 device_busy` 是什么？**
 
@@ -297,7 +294,6 @@ cat /proc/asound/cards
 | `0` | 正常运行 / 收到停止信号 | — |
 | `2` | 配置无效 | 检查环境变量格式（端口范围、布尔值拼写等） |
 | `3` | 未检测到声卡 | 检查 `/dev/snd` 挂载与宿主声卡 |
-| `4` | 混音器初始化失败 | 检查 `ALSA_*` 控制名与 `amixer` 可用性 |
 | `5` | MPD 内核启动失败 | 查看日志内 MPD 尾部输出（目录权限/配置） |
 | `6` | 妙播接收端或 DLNA 渲染器启动失败 | 检查 5353/1900 组播绑定与端口占用 |
 

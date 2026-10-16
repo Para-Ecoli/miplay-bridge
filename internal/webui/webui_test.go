@@ -27,13 +27,16 @@ func TestHandlerServesConsole(t *testing.T) {
 			"清除妙播连接",
 			"清除 DLNA 连接",
 			"测试声卡",
+			"总控",
 			"硬件混音器",
-			"mixer-panel",
+			"mixer-playback",
+			"mixer-capture",
 			"/api/status",
-			"/api/mixer",
 			"/api/miplay/disconnect",
 			"/api/dlna/disconnect",
 			"/api/test-play",
+			"/api/control",
+			"/api/mixer",
 		} {
 			if !strings.Contains(body, expected) {
 				t.Fatalf("%s body missing %q", path, expected)
@@ -55,7 +58,7 @@ func TestEmbeddedPageCarriesConsoleWiring(t *testing.T) {
 	// The embedded page must keep the token plumbing the API guard expects
 	// and stay free of external resources (offline LAN requirement).
 	page := string(indexHTML)
-	for _, expected := range []string{"x-bridge-token", "localStorage", "miplay-bridge-token"} {
+	for _, expected := range []string{"x-bridge-token", "localStorage", "miplay-bridge-token", "mixer-card-info", "mixer-sources"} {
 		if !strings.Contains(page, expected) {
 			t.Fatalf("index.html missing %q", expected)
 		}
@@ -63,6 +66,12 @@ func TestEmbeddedPageCarriesConsoleWiring(t *testing.T) {
 	for _, forbidden := range []string{"http://cdn", "https://cdn", "unpkg.com", "jsdelivr"} {
 		if strings.Contains(page, forbidden) {
 			t.Fatalf("index.html must not reference the external host %q", forbidden)
+		}
+	}
+	// The standalone WebMixer page is gone: nothing may link or brand back to it.
+	for _, forbidden := range []string{"WebMixer", "webmixer/", "/webmixer"} {
+		if strings.Contains(page, forbidden) {
+			t.Fatalf("index.html must not reference the retired WebMixer page (%q)", forbidden)
 		}
 	}
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/miplay-bridge/miplay-bridge/internal/config"
 	"github.com/miplay-bridge/miplay-bridge/internal/dlna"
 	"github.com/miplay-bridge/miplay-bridge/internal/miplay"
+	"github.com/miplay-bridge/miplay-bridge/internal/mix"
 	"github.com/miplay-bridge/miplay-bridge/internal/mpd"
 	"github.com/miplay-bridge/miplay-bridge/internal/output"
 	"github.com/miplay-bridge/miplay-bridge/internal/webui"
@@ -28,16 +29,17 @@ import (
 var Version = "0.1.0"
 
 // Options configures a Server. Engine may be nil in tests; the MiPlay and
-// DLNA pointers are nil when the corresponding feature is disabled.
+// DLNA pointers are nil when the corresponding feature is disabled, and
+// Mixer is nil when the hardware mixer console is unavailable.
 type Options struct {
 	Config config.Config
 	Logger *slog.Logger
 	Report alsa.Report
-	Mixer  *alsa.Mixer
 	Engine *output.Engine
 	MiPlay *miplay.Receiver
 	DLNA   *dlna.Renderer
 	Tone   *ToneProvider
+	Mixer  *mix.Controller
 }
 
 // Server holds the HTTP dependencies.
@@ -45,10 +47,10 @@ type Server struct {
 	cfg       config.Config
 	logger    *slog.Logger
 	report    alsa.Report
-	mixer     *alsa.Mixer
 	engine    *output.Engine
 	miplay    *miplay.Receiver
 	dlna      *dlna.Renderer
+	mixer     *mix.Controller
 	client    *mpd.Client
 	tone      *ToneProvider
 	token     string
@@ -65,10 +67,10 @@ func New(opts Options) *Server {
 		cfg:       opts.Config,
 		logger:    logger,
 		report:    opts.Report,
-		mixer:     opts.Mixer,
 		engine:    opts.Engine,
 		miplay:    opts.MiPlay,
 		dlna:      opts.DLNA,
+		mixer:     opts.Mixer,
 		tone:      opts.Tone,
 		token:     strings.TrimSpace(opts.Config.Token),
 		startedAt: time.Now().UTC(),
@@ -97,13 +99,16 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/devices", s.guard(s.devices))
 	mux.HandleFunc("POST /api/play", s.guard(s.play))
 	mux.HandleFunc("POST /api/control", s.guard(s.control))
-	mux.HandleFunc("POST /api/volume", s.guard(s.volume))
-	mux.HandleFunc("POST /api/mixer", s.guard(s.mixerControl))
 	mux.HandleFunc("POST /api/test-play", s.guard(s.testPlay))
 
 	// One-click cast clearing for the embedded console and remote API callers.
 	mux.HandleFunc("POST /api/miplay/disconnect", s.guard(s.miplayDisconnect))
 	mux.HandleFunc("POST /api/dlna/disconnect", s.guard(s.dlnaDisconnect))
+
+	// Hardware mixer console: full control-level read and write, the same
+	// shapes the former standalone webmixer served on /api/mixer.
+	mux.HandleFunc("GET /api/mixer", s.guard(s.mixerState))
+	mux.HandleFunc("POST /api/mixer", s.guard(s.mixerSet))
 
 	// The generated test tone is fetched by MPD itself over loopback, so it
 	// cannot carry the API token. Access is bounded by an unguessable path
@@ -272,19 +277,11 @@ func (s *Server) ready() bool {
 	if s.engine == nil || s.client == nil {
 		return false
 	}
-	mixerState := alsa.State{}
-	if s.mixer != nil {
-		mixerState = s.mixer.State()
-	}
-	return s.report.Ready() && mixerState.Initialized && s.kernelSnapshot().Running
+	return s.report.Ready() && s.kernelSnapshot().Running
 }
 
 // healthPayload builds the /healthz body.
 func (s *Server) healthPayload() (map[string]any, bool) {
-	mixerState := alsa.State{}
-	if s.mixer != nil {
-		mixerState = s.mixer.State()
-	}
 	kernel := s.kernelSnapshot()
 	ready := s.ready()
 
@@ -303,19 +300,12 @@ func (s *Server) healthPayload() (map[string]any, bool) {
 		"uptime_seconds": int(time.Since(s.startedAt).Seconds()),
 		"container":      map[string]any{"alive": true},
 		"sound_card":     s.report,
-		"mixer":          mixerState,
 		"mpd":            kernel,
-		// auto_mute_fixed is duplicated at the top level because it is the one
-		// flag that explains "everything green but no sound".
-		"auto_mute_fixed": mixerState.AutoMuteFixed,
 	}
 	if !ready {
 		reasons := []string{}
 		if !s.report.Present {
 			reasons = append(reasons, "sound card is not available")
-		}
-		if !mixerState.Initialized {
-			reasons = append(reasons, "mixer is not initialised")
 		}
 		if !kernel.Running {
 			reasons = append(reasons, "playback kernel is not running")
@@ -335,9 +325,7 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, payload)
 }
 
-// playbackSnapshot reads live playback state from the kernel. The volume
-// field reports the hardware mixer when one is initialised: the mixer is the
-// volume authority, and the kernel's cached number is only its mirror.
+// playbackSnapshot reads live playback state from the kernel.
 func (s *Server) playbackSnapshot(ctx context.Context) (map[string]any, error) {
 	if s.client == nil {
 		return nil, mpd.ErrUnavailable
@@ -350,13 +338,8 @@ func (s *Server) playbackSnapshot(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	volume := atoiOr(status["volume"], -1)
-	if s.mixer != nil && s.mixer.State().Initialized {
-		volume = s.mixer.State().VolumePercent
-	}
 	playback := map[string]any{
 		"state":       status["state"],
-		"volume":      volume,
 		"elapsed":     atofOr(status["elapsed"], 0),
 		"duration":    atofOr(status["duration"], 0),
 		"bitrate":     status["bitrate"],
@@ -380,39 +363,22 @@ func (s *Server) playbackSnapshot(ctx context.Context) (map[string]any, error) {
 
 // status returns the full bridge status.
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
-	// The console polls this endpoint every two seconds; re-read the hardware
-	// control first so the reported level tracks out-of-band changes (a
-	// host-side amixer invocation, the kernel's own mixer writes) instead of a
-	// stale snapshot. On failure the last snapshot is kept. The per-control
-	// snapshot below also pays one amixer read per control, hence the wider
-	// timeout.
-	refreshCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-	s.refreshMixer(refreshCtx)
-	controls := s.mixerControls(refreshCtx)
-	cancel()
-	mixerState := alsa.State{}
-	if s.mixer != nil {
-		mixerState = s.mixer.State()
-	}
 	kernel := s.kernelSnapshot()
 	playback, err := s.playbackSnapshot(r.Context())
 	if err != nil {
 		playback = map[string]any{"state": "unknown", "error": err.Error()}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"success":         true,
-		"service_online":  true,
-		"version":         Version,
-		"uptime_seconds":  int(time.Since(s.startedAt).Seconds()),
-		"sound_card":      s.report,
-		"mixer":           mixerState,
-		"mixer_controls":  controls,
-		"mpd":             kernel,
-		"playback":        playback,
-		"auto_mute_fixed": mixerState.AutoMuteFixed,
-		"active_source":   s.activeSource(),
-		"miplay":          s.miplayStatus(),
-		"dlna":            s.dlnaStatus(),
+		"success":        true,
+		"service_online": true,
+		"version":        Version,
+		"uptime_seconds": int(time.Since(s.startedAt).Seconds()),
+		"sound_card":     s.report,
+		"mpd":            kernel,
+		"playback":       playback,
+		"active_source":  s.activeSource(),
+		"miplay":         s.miplayStatus(),
+		"dlna":           s.dlnaStatus(),
 	})
 }
 

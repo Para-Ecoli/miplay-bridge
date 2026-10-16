@@ -1,7 +1,9 @@
+// Package alsa probes the host sound card through /dev/snd. It deliberately
+// performs no mixer operation: the bridge never reads or writes ALSA mixer
+// controls, so probing is the only thing left in this package.
 package alsa
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -60,9 +62,6 @@ type Report struct {
 	// ControlAccess / PCMAccess are the open() results for those nodes.
 	ControlAccess AccessState `json:"control_access"`
 	PCMAccess     AccessState `json:"pcm_access"`
-	// ControlNames are the simple mixer controls, read through the ALSA
-	// control API (amixer). Never from /proc/asound.
-	ControlNames []string `json:"control_names,omitempty"`
 	// Reason explains a non-ready probe in operator language.
 	Reason string `json:"reason,omitempty"`
 }
@@ -146,7 +145,7 @@ func probeAccess(path string) AccessState {
 // Probe inspects the host sound card and returns a report. The returned error
 // is non-nil only when the card is unusable, and its message is written to be
 // shown verbatim to the operator in `docker logs`.
-func Probe(ctx context.Context, cfg config.Config, mixer *Mixer, logger *slog.Logger) (Report, error) {
+func Probe(cfg config.Config, logger *slog.Logger) (Report, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -210,15 +209,6 @@ func Probe(ctx context.Context, cfg config.Config, mixer *Mixer, logger *slog.Lo
 	if report.PCMAccess == AccessBusy {
 		logger.Warn("playback device is currently busy; continuing because ALSA has no dmix and a stale holder is not fatal",
 			"device", report.HardwareDevice)
-	}
-
-	if mixer != nil {
-		controls, controlErr := mixer.Controls(ctx)
-		if controlErr != nil {
-			logger.Warn("could not enumerate mixer controls through amixer", "error", controlErr)
-		} else {
-			report.ControlNames = controls
-		}
 	}
 	return report, nil
 }

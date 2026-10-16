@@ -29,6 +29,7 @@ go.work.sum
 # ---- 环境与本地覆盖 ----
 .env
 *.local
+docker-compose.yml
 
 # ---- 编辑器 / 操作系统 ----
 .idea/

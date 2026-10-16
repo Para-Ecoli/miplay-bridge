@@ -19,7 +19,6 @@ type fakeMPD struct {
 
 	mu       sync.Mutex
 	commands []string
-	volume   int
 	state    string
 	busy     bool
 }
@@ -30,7 +29,7 @@ func newFakeMPD(t *testing.T) *fakeMPD {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &fakeMPD{listener: listener, state: "stop", volume: 50}
+	server := &fakeMPD{listener: listener, state: "stop"}
 	go server.serve()
 	t.Cleanup(func() { listener.Close() })
 	return server
@@ -80,9 +79,9 @@ func (s *fakeMPD) handle(connection net.Conn) {
 			fmt.Fprint(connection, "OK\n")
 		case "status":
 			s.mu.Lock()
-			volume, state := s.volume, s.state
+			state := s.state
 			s.mu.Unlock()
-			fmt.Fprintf(connection, "volume: %d\nrepeat: 0\nrandom: 0\nsingle: 0\nconsume: 0\nstate: %s\nelapsed: 3.500\nduration: 210.000\nbitrate: 900\naudio: 44100:16:2\nOK\n", volume, state)
+			fmt.Fprintf(connection, "repeat: 0\nrandom: 0\nsingle: 0\nconsume: 0\nstate: %s\nelapsed: 3.500\nduration: 210.000\nbitrate: 900\naudio: 44100:16:2\nOK\n", state)
 		case "currentsong":
 			fmt.Fprint(connection, "file: http://127.0.0.1:8080/stream/1\nTitle: Test Track\nArtist: Test Artist\nAlbum: Test Album\nduration: 210.000\nOK\n")
 		case "clear", "play", "pause", "stop", "next", "previous", "seekcur", "repeat", "random", "single", "consume", "add":
@@ -99,15 +98,6 @@ func (s *fakeMPD) handle(connection net.Conn) {
 			if command[0] == "stop" {
 				s.mu.Lock()
 				s.state = "stop"
-				s.mu.Unlock()
-			}
-			fmt.Fprint(connection, "OK\n")
-		case "setvol":
-			if len(command) > 1 {
-				var volume int
-				fmt.Sscanf(command[1], "%d", &volume)
-				s.mu.Lock()
-				s.volume = volume
 				s.mu.Unlock()
 			}
 			fmt.Fprint(connection, "OK\n")
@@ -144,7 +134,7 @@ func TestClientRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status["state"] != "stop" || status["volume"] != "50" {
+	if status["state"] != "stop" {
 		t.Fatalf("status = %v", status)
 	}
 	song, err := client.CurrentSong(ctx)
@@ -153,16 +143,6 @@ func TestClientRoundTrip(t *testing.T) {
 	}
 	if song["Title"] != "Test Track" || song["Artist"] != "Test Artist" {
 		t.Fatalf("song = %v", song)
-	}
-	if err := client.SetVolume(ctx, 70); err != nil {
-		t.Fatal(err)
-	}
-	status, err = client.Status(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if status["volume"] != "70" {
-		t.Fatalf("volume after setvol = %q", status["volume"])
 	}
 	if err := client.Clear(ctx); err != nil {
 		t.Fatal(err)
@@ -182,23 +162,6 @@ func TestClientRoundTrip(t *testing.T) {
 	}
 	if err := client.SeekCur(ctx, 90*time.Second); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestClientClampsVolume(t *testing.T) {
-	server := newFakeMPD(t)
-	client := NewClient(server.addr(), 3*time.Second)
-	if err := client.SetVolume(context.Background(), 250); err != nil {
-		t.Fatal(err)
-	}
-	found := false
-	for _, command := range server.recorded() {
-		if command == "setvol 100" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("expected a clamped setvol 100, got %v", server.recorded())
 	}
 }
 

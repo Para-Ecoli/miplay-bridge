@@ -1,13 +1,17 @@
 package alsa
 
 import (
-	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/miplay-bridge/miplay-bridge/internal/config"
 )
+
+func testLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+}
 
 func TestEnumerateCardsUsesOnlyDevSnd(t *testing.T) {
 	directory := t.TempDir()
@@ -38,7 +42,7 @@ func TestProbeReportsMissingSoundDirectory(t *testing.T) {
 	cfg := config.Default()
 	cfg.SoundDirectory = filepath.Join(t.TempDir(), "not-there")
 
-	report, err := Probe(context.Background(), cfg, nil, testLogger())
+	report, err := Probe(cfg, testLogger())
 	if err == nil {
 		t.Fatal("Probe must fail when /dev/snd is absent")
 	}
@@ -61,7 +65,7 @@ func TestProbeReportsMissingCard(t *testing.T) {
 	cfg.SoundDirectory = directory
 	cfg.Card = 1
 
-	report, err := Probe(context.Background(), cfg, nil, testLogger())
+	report, err := Probe(cfg, testLogger())
 	if err == nil {
 		t.Fatal("Probe must fail when the configured card does not exist")
 	}
@@ -80,10 +84,7 @@ func TestProbeSucceedsWithPlayableCard(t *testing.T) {
 	cfg := config.Default()
 	cfg.SoundDirectory = directory
 
-	fake := newFakeAmixer()
-	mixer := New(cfg, testLogger()).WithRunner(fake.run)
-
-	report, err := Probe(context.Background(), cfg, mixer, testLogger())
+	report, err := Probe(cfg, testLogger())
 	if err != nil {
 		t.Fatalf("Probe: %v", err)
 	}
@@ -92,9 +93,6 @@ func TestProbeSucceedsWithPlayableCard(t *testing.T) {
 	}
 	if report.HardwareDevice != "hw:0,0" {
 		t.Fatalf("HardwareDevice = %q", report.HardwareDevice)
-	}
-	if len(report.ControlNames) != 4 {
-		t.Fatalf("ControlNames = %v, want the 4 fake controls", report.ControlNames)
 	}
 }
 
@@ -106,7 +104,7 @@ func TestProbeReportsMissingPlaybackDevice(t *testing.T) {
 	cfg := config.Default()
 	cfg.SoundDirectory = directory
 
-	report, err := Probe(context.Background(), cfg, nil, testLogger())
+	report, err := Probe(cfg, testLogger())
 	if err == nil {
 		t.Fatal("Probe must fail when the card has no playback device")
 	}

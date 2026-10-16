@@ -27,8 +27,6 @@ type TemplateData struct {
 	Port              int
 	LogFile           string
 	Device            string
-	MixerDevice       string
-	MixerControl      string
 }
 
 // Snapshot is the process-level view of the playback kernel.
@@ -40,7 +38,6 @@ type Snapshot struct {
 	LastError   string    `json:"last_error,omitempty"`
 	StartedAt   time.Time `json:"started_at,omitempty"`
 	ProtocolVer string    `json:"protocol_version,omitempty"`
-	MixerMode   string    `json:"mixer_mode"`
 }
 
 // Manager owns the MPD child process.
@@ -55,7 +52,6 @@ type Manager struct {
 	restarts   int
 	lastError  string
 	startedAt  time.Time
-	mixerMode  string
 	tail       *ringBuffer
 	template   *template.Template
 	supervise  sync.WaitGroup
@@ -83,30 +79,6 @@ func (m *Manager) Client() *Client { return m.client }
 // ConfigPath is the rendered MPD configuration path.
 func (m *Manager) ConfigPath() string { return m.configPath }
 
-// SetMixerControl decides between MPD's hardware and software mixer. The shell
-// passes an empty control when the probed card does not expose it, because MPD
-// refuses to start when a hardware mixer control is missing.
-func (m *Manager) SetMixerControl(control string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.cfg.MPDMixerControl = control
-	if strings.TrimSpace(control) == "" {
-		m.mixerMode = "software"
-	} else {
-		m.mixerMode = "hardware"
-	}
-}
-
-// MixerMode reports "hardware" or "software".
-func (m *Manager) MixerMode() string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.mixerMode == "" {
-		return "hardware"
-	}
-	return m.mixerMode
-}
-
 // TemplateData builds the substitution model from the configuration.
 func (m *Manager) TemplateData() TemplateData {
 	m.mu.Lock()
@@ -121,8 +93,6 @@ func (m *Manager) TemplateData() TemplateData {
 		Port:              cfg.MPDPort,
 		LogFile:           cfg.MPDLogFile,
 		Device:            cfg.ALSAHardwareDevice(),
-		MixerDevice:       cfg.ALSAHardwareCard(),
-		MixerControl:      cfg.MPDMixerControl,
 	}
 }
 
@@ -235,7 +205,7 @@ func (m *Manager) spawn(ctx context.Context) error {
 	m.running = true
 	m.startedAt = time.Now().UTC()
 	m.mu.Unlock()
-	m.logger.Info("mpd started", "pid", command.Process.Pid, "config", configPath, "mixer_mode", m.MixerMode())
+	m.logger.Info("mpd started", "pid", command.Process.Pid, "config", configPath)
 
 	if err := m.client.WaitReady(ctx, startTimeout); err != nil {
 		m.logger.Error("mpd did not become ready", "error", err, "mpd_log_tail", m.tail.String())
@@ -370,10 +340,6 @@ func (m *Manager) Snapshot() Snapshot {
 		LastError:   m.lastError,
 		StartedAt:   m.startedAt,
 		ProtocolVer: m.client.Version(),
-		MixerMode:   m.mixerMode,
-	}
-	if snapshot.MixerMode == "" {
-		snapshot.MixerMode = "hardware"
 	}
 	if m.command != nil && m.command.Process != nil {
 		snapshot.PID = m.command.Process.Pid
@@ -459,10 +425,7 @@ audio_output {
     type            "alsa"
     name            "妙播桥"
     device          "{{.Device}}"
-{{if .MixerControl}}    mixer_type      "hardware"
-    mixer_device    "{{.MixerDevice}}"
-    mixer_control   "{{.MixerControl}}"
-{{else}}    mixer_type      "software"
-{{end}}    auto_resample   "no"
+    mixer_type      "null"
+    auto_resample   "no"
 }
 `

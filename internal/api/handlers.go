@@ -12,13 +12,11 @@ import (
 	"net/http"
 	"net/url"
 	"path"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/miplay-bridge/miplay-bridge/internal/alsa"
 	"github.com/miplay-bridge/miplay-bridge/internal/config"
 	"github.com/miplay-bridge/miplay-bridge/internal/mpd"
 	"github.com/miplay-bridge/miplay-bridge/internal/output"
@@ -33,7 +31,6 @@ type playRequest struct {
 	Title       string   `json:"title"`
 	Artist      string   `json:"artist"`
 	Album       string   `json:"album"`
-	Volume      *int     `json:"volume"`
 	Position    *float64 `json:"position"`
 	StartPaused bool     `json:"start_paused"`
 }
@@ -75,13 +72,6 @@ func (s *Server) play(w http.ResponseWriter, r *http.Request) {
 		s.engine.Release(output.SourceAPI)
 		s.writeKernelError(w, err)
 		return
-	}
-	if request.Volume != nil {
-		if _, err := s.engine.SetVolume(ctx, *request.Volume); err != nil {
-			s.engine.Release(output.SourceAPI)
-			s.writeKernelError(w, err)
-			return
-		}
 	}
 	if err := s.engine.Play(ctx); err != nil {
 		s.engine.Release(output.SourceAPI)
@@ -221,161 +211,6 @@ func (s *Server) control(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// /api/volume
-// ---------------------------------------------------------------------------
-
-type volumeRequest struct {
-	Volume *int  `json:"volume"`
-	Mute   *bool `json:"mute"`
-}
-
-func (s *Server) volume(w http.ResponseWriter, r *http.Request) {
-	var request volumeRequest
-	if err := decodeBody(w, r, &request); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error(), "invalid_request")
-		return
-	}
-	if request.Volume == nil && request.Mute == nil {
-		writeError(w, http.StatusBadRequest, "either volume or mute is required", "invalid_request")
-		return
-	}
-	// Volume and mute are hardware-mixer operations: they stay available even
-	// when the playback kernel is down, as long as the engine is wired.
-	if s.engine == nil {
-		writeError(w, http.StatusServiceUnavailable, "playback engine is unavailable", "mpd_unavailable")
-		return
-	}
-	ctx := r.Context()
-
-	if request.Volume != nil {
-		volume := *request.Volume
-		if volume < 0 || volume > 100 {
-			writeError(w, http.StatusBadRequest, "volume must be between 0 and 100", "invalid_request")
-			return
-		}
-		// The hardware mixer is the volume authority shared by MiPlay, DLNA
-		// and the API; the engine also mirrors the level into the kernel.
-		if _, err := s.engine.SetVolume(ctx, volume); err != nil {
-			s.writeKernelError(w, err)
-			return
-		}
-	}
-	if request.Mute != nil {
-		// The hardware mute switch, not a volume-zero trick: the slider keeps
-		// its position and unmute restores the exact level.
-		if _, err := s.engine.SetMute(ctx, *request.Mute); err != nil {
-			writeError(w, http.StatusServiceUnavailable, "could not toggle the hardware mute: "+err.Error(), "mixer_unavailable")
-			return
-		}
-	}
-	s.refreshMixer(ctx)
-	s.writePlayback(w, ctx, http.StatusOK)
-}
-
-// ---------------------------------------------------------------------------
-// /api/mixer
-// ---------------------------------------------------------------------------
-
-type mixerControlRequest struct {
-	Name   string  `json:"name"`
-	Volume *int    `json:"volume"`
-	Muted  *bool   `json:"muted"`
-	Item   *string `json:"item"`
-}
-
-// mixerControl adjusts one hardware mixer control by name, the way alsamixer's
-// playback view treats it: any listed control can carry a volume, a mute
-// switch or an enum item. Only the effective control's volume and switch are
-// special-cased through the engine, because those writes also mirror into the
-// playback kernel and feed the rest of the API surface.
-func (s *Server) mixerControl(w http.ResponseWriter, r *http.Request) {
-	var request mixerControlRequest
-	if err := decodeBody(w, r, &request); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error(), "invalid_request")
-		return
-	}
-	name := strings.TrimSpace(request.Name)
-	if name == "" {
-		writeError(w, http.StatusBadRequest, "name is required", "invalid_request")
-		return
-	}
-	if request.Volume == nil && request.Muted == nil && request.Item == nil {
-		writeError(w, http.StatusBadRequest, "one of volume, muted or item is required", "invalid_request")
-		return
-	}
-	if s.mixer == nil {
-		writeError(w, http.StatusServiceUnavailable, "hardware mixer is unavailable", "mixer_unavailable")
-		return
-	}
-
-	// The control must be one the card actually exposes. The mixer's own
-	// control list is authoritative; the probe report covers the window before
-	// Init completes.
-	known := s.mixer.State().Controls
-	if len(known) == 0 {
-		known = s.report.ControlNames
-	}
-	if len(known) > 0 && !slices.Contains(known, name) {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown mixer control %q", name), "invalid_request")
-		return
-	}
-
-	ctx := r.Context()
-	effective := s.mixer.State().EffectiveControl
-	if request.Volume != nil {
-		volume := *request.Volume
-		if volume < 0 || volume > 100 {
-			writeError(w, http.StatusBadRequest, "volume must be between 0 and 100", "invalid_request")
-			return
-		}
-		if name == effective && s.engine != nil {
-			// The effective control is the system volume: route it through the
-			// engine so the kernel mirror follows, exactly like /api/volume.
-			if _, err := s.engine.SetVolume(ctx, volume); err != nil {
-				s.writeKernelError(w, err)
-				return
-			}
-		} else if _, err := s.mixer.SimpleSet(ctx, name, strconv.Itoa(volume)+"%"); err != nil {
-			writeError(w, http.StatusBadGateway, "could not set the mixer control: "+err.Error(), "mixer_error")
-			return
-		}
-	}
-	if request.Muted != nil {
-		if name == effective && s.engine != nil {
-			if _, err := s.engine.SetMute(ctx, *request.Muted); err != nil {
-				writeError(w, http.StatusBadGateway, "could not set the mixer control: "+err.Error(), "mixer_error")
-				return
-			}
-		} else {
-			value := "mute"
-			if !*request.Muted {
-				value = "unmute"
-			}
-			if _, err := s.mixer.SimpleSet(ctx, name, value); err != nil {
-				writeError(w, http.StatusBadGateway, "could not set the mixer control: "+err.Error(), "mixer_error")
-				return
-			}
-		}
-	}
-	if request.Item != nil {
-		item := strings.TrimSpace(*request.Item)
-		if item == "" {
-			writeError(w, http.StatusBadRequest, "item must not be empty", "invalid_request")
-			return
-		}
-		if _, err := s.mixer.SimpleSet(ctx, name, item); err != nil {
-			writeError(w, http.StatusBadGateway, "could not set the mixer control: "+err.Error(), "mixer_error")
-			return
-		}
-	}
-	s.refreshMixer(ctx)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"success": true,
-		"control": name,
-	})
-}
-
-// ---------------------------------------------------------------------------
 // /api/miplay/disconnect  and  /api/dlna/disconnect
 // ---------------------------------------------------------------------------
 
@@ -423,7 +258,6 @@ type testPlayResponse struct {
 	URL       string `json:"url"`
 	Seconds   int    `json:"seconds"`
 	Frequency int    `json:"frequency_hz"`
-	Mixer     any    `json:"mixer"`
 	Playback  any    `json:"playback"`
 }
 
@@ -459,10 +293,6 @@ func (s *Server) testPlay(w http.ResponseWriter, r *http.Request) {
 	if playbackErr != nil {
 		playback = map[string]any{"state": "unknown", "error": playbackErr.Error()}
 	}
-	mixerState := any(nil)
-	if s.mixer != nil {
-		mixerState = s.mixer.State()
-	}
 	s.logger.Info("test tone dispatched to the playback kernel",
 		"url", toneURL, "seconds", s.cfg.TestToneSeconds, "frequency_hz", s.cfg.TestToneFrequencyHz)
 	writeJSON(w, http.StatusOK, testPlayResponse{
@@ -470,7 +300,6 @@ func (s *Server) testPlay(w http.ResponseWriter, r *http.Request) {
 		URL:       toneURL,
 		Seconds:   s.cfg.TestToneSeconds,
 		Frequency: s.cfg.TestToneFrequencyHz,
-		Mixer:     mixerState,
 		Playback:  playback,
 	})
 }
@@ -503,30 +332,7 @@ func (s *Server) writePlayback(w http.ResponseWriter, ctx context.Context, statu
 		writeJSON(w, status, map[string]any{"success": true, "playback_error": err.Error()})
 		return
 	}
-	mixerState := any(nil)
-	if s.mixer != nil {
-		mixerState = s.mixer.State()
-	}
-	writeJSON(w, status, map[string]any{"success": true, "playback": playback, "mixer": mixerState})
-}
-
-func (s *Server) refreshMixer(ctx context.Context) {
-	if s.mixer == nil {
-		return
-	}
-	if _, err := s.mixer.Refresh(ctx); err != nil {
-		s.logger.Debug("could not refresh mixer snapshot", "error", err)
-	}
-}
-
-// mixerControls reads the per-control mixer snapshot the console renders as
-// the hardware mixer panel: exactly the controls whose playback view can be
-// adjusted, the same set alsamixer offers.
-func (s *Server) mixerControls(ctx context.Context) []alsa.ControlState {
-	if s.mixer == nil {
-		return nil
-	}
-	return s.mixer.Snapshot(ctx)
+	writeJSON(w, status, map[string]any{"success": true, "playback": playback})
 }
 
 // resolvePlayURI turns the API's url field into the URI that is pushed

@@ -29,10 +29,8 @@ func TestRenderConfigUsesVerifiedAudioOutput(t *testing.T) {
 port "{{.Port}}"
 audio_output {
     device "{{.Device}}"
-{{if .MixerControl}}    mixer_type "hardware"
-    mixer_control "{{.MixerControl}}"
-{{else}}    mixer_type "software"
-{{end}}}
+    mixer_type "null"
+}
 `
 	if err := os.WriteFile(cfg.MPDTemplatePath, []byte(template), 0o600); err != nil {
 		t.Fatal(err)
@@ -45,32 +43,10 @@ audio_output {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{`device "hw:0,0"`, `mixer_type "hardware"`, `mixer_control "Headphone"`} {
+	for _, expected := range []string{`device "hw:0,0"`, `mixer_type "null"`} {
 		if !strings.Contains(rendered, expected) {
 			t.Fatalf("rendered config missing %q:\n%s", expected, rendered)
 		}
-	}
-}
-
-func TestRenderConfigFallsBackToSoftwareMixer(t *testing.T) {
-	cfg := testConfig(t)
-	if err := os.WriteFile(cfg.MPDTemplatePath, []byte("{{if .MixerControl}}hardware:{{.MixerControl}}{{else}}software{{end}}"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	manager := NewManager(cfg, nil)
-	if err := manager.LoadTemplate(); err != nil {
-		t.Fatal(err)
-	}
-	manager.SetMixerControl("")
-	if manager.MixerMode() != "software" {
-		t.Fatalf("MixerMode = %q", manager.MixerMode())
-	}
-	rendered, err := manager.RenderConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rendered != "software" {
-		t.Fatalf("rendered = %q", rendered)
 	}
 }
 
@@ -136,9 +112,6 @@ func TestSnapshotDefaults(t *testing.T) {
 	snapshot := manager.Snapshot()
 	if snapshot.Running {
 		t.Fatal("a fresh manager must not report a running kernel")
-	}
-	if snapshot.MixerMode != "hardware" {
-		t.Fatalf("MixerMode = %q", snapshot.MixerMode)
 	}
 	if snapshot.ConfigPath != cfg.MPDConfPath {
 		t.Fatalf("ConfigPath = %q", snapshot.ConfigPath)

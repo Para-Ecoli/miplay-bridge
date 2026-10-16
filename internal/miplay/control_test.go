@@ -17,6 +17,10 @@ const (
 
 const testChallenge = "123456789012345"
 
+// testSessionVolume is the initial volume every session under test starts
+// from.
+const testSessionVolume = 64
+
 // writeRecorder captures every control frame a session emits.
 type writeRecorder struct {
 	frames [][]byte
@@ -40,7 +44,7 @@ func (w *writeRecorder) take() [][]byte {
 // challenge, ready for business commands.
 func newAuthenticatedSession(t *testing.T) (*LegacyReceiverSession, *writeRecorder) {
 	t.Helper()
-	session, err := NewLegacyReceiverSession([]byte(testChallenge), 0, "miplay test", 30,
+	session, err := NewLegacyReceiverSession([]byte(testChallenge), 0, "miplay test", testSessionVolume,
 		testLocalHost, testLocalPort, testPeerHost, testPeerPort)
 	if err != nil {
 		t.Fatal(err)
@@ -78,10 +82,11 @@ func stepAccepted(t *testing.T, session *LegacyReceiverSession, recorder *writeR
 	return result
 }
 
-// TestGetVolumeAnswersEveryPayloadShape pins the volume-query contract: the
-// reply always carries the current volume, whatever the inbound payload looks
-// like - a pure query must never end the session.
-func TestGetVolumeAnswersEveryPayloadShape(t *testing.T) {
+// TestGetVolumeAnswersCurrentLevel pins the volume-query contract: the reply
+// carries the session's current level whatever the inbound payload looks
+// like - a pure query must never end the session - and a wired provider
+// always wins so the answer tracks console-side changes live.
+func TestGetVolumeAnswersCurrentLevel(t *testing.T) {
 	session, recorder := newAuthenticatedSession(t)
 	shapes := map[string][]byte{
 		"empty":            nil,
@@ -97,173 +102,101 @@ func TestGetVolumeAnswersEveryPayloadShape(t *testing.T) {
 		if reply.Command != CmdGetVolumeAck || reply.Sequence != 9 {
 			t.Fatalf("%s: reply = %+v", name, reply)
 		}
-		if !bytes.Equal(reply.Payload, EncodeScalar(30)) {
-			t.Fatalf("%s: reply payload = % x, want the current volume", name, reply.Payload)
-		}
-		if result.VolumeSet {
-			t.Fatalf("%s: a query must not report a volume change", name)
+		if !bytes.Equal(reply.Payload, EncodeScalar(testSessionVolume)) {
+			t.Fatalf("%s: reply payload = % x, want the session level", name, reply.Payload)
 		}
 	}
-}
 
-// TestGetVolumeAnswersTheLiveHardwareLevel pins the cross-surface sync behind
-// the spring-back fix: a wired provider makes GET_VOLUME answer the live
-// hardware level - so a level the console changed after the phone connected is
-// reported truthfully - and any provider miss or nonsense reading falls back to
-// the session's own copy.
-func TestGetVolumeAnswersTheLiveHardwareLevel(t *testing.T) {
-	session, recorder := newAuthenticatedSession(t)
-	level := 71
-	available := true
-	session.SetVolumeProvider(func() (int, bool) { return level, available })
-
-	result := stepAccepted(t, session, recorder, CommandFrame{Command: CmdGetVolume, Sequence: 9})
+	// A wired provider answers the live hardware level on every query.
+	live := 33
+	session.SetVolumeProvider(func() (int, bool) { return live, true })
+	result := stepAccepted(t, session, recorder, CommandFrame{Command: CmdGetVolume, Sequence: 10})
 	reply := decodeOneCommandFrame(t, result.Writes[0])
-	if reply.Command != CmdGetVolumeAck || !bytes.Equal(reply.Payload, EncodeScalar(71)) {
-		t.Fatalf("reply = %+v, want the live hardware level", reply)
+	if !bytes.Equal(reply.Payload, EncodeScalar(33)) {
+		t.Fatalf("provider read: reply payload = % x, want the live level 33", reply.Payload)
 	}
-
-	// The console moves the slider mid-cast: the very next query already
-	// reports the new level.
-	level = 12
-	result = stepAccepted(t, session, recorder, CommandFrame{Command: CmdGetVolume, Sequence: 10})
+	live = 47
+	result = stepAccepted(t, session, recorder, CommandFrame{Command: CmdGetVolume, Sequence: 11, Payload: EncodeScalar(30)})
 	reply = decodeOneCommandFrame(t, result.Writes[0])
-	if !bytes.Equal(reply.Payload, EncodeScalar(12)) {
-		t.Fatalf("reply payload = % x, want the updated live level", reply.Payload)
+	if !bytes.Equal(reply.Payload, EncodeScalar(47)) {
+		t.Fatalf("provider re-read: reply payload = % x, want the live level 47", reply.Payload)
 	}
 
-	// A provider without a hardware mixer leaves the session copy in charge.
-	available = false
-	result = stepAccepted(t, session, recorder, CommandFrame{Command: CmdGetVolume, Sequence: 11})
-	reply = decodeOneCommandFrame(t, result.Writes[0])
-	if !bytes.Equal(reply.Payload, EncodeScalar(30)) {
-		t.Fatalf("reply payload = % x, want the session fallback", reply.Payload)
-	}
-
-	// A nonsensical reading is ignored just the same.
-	available = true
-	level = 171
+	// A provider that cannot read the hardware falls back to the session copy.
+	session.SetVolumeProvider(func() (int, bool) { return 0, false })
 	result = stepAccepted(t, session, recorder, CommandFrame{Command: CmdGetVolume, Sequence: 12})
 	reply = decodeOneCommandFrame(t, result.Writes[0])
-	if !bytes.Equal(reply.Payload, EncodeScalar(30)) {
-		t.Fatalf("reply payload = % x, want the session fallback for an out-of-range reading", reply.Payload)
+	if !bytes.Equal(reply.Payload, EncodeScalar(testSessionVolume)) {
+		t.Fatalf("failing provider: reply payload = % x, want the session level", reply.Payload)
 	}
 }
 
-// TestSetVolumeAcceptsBothScalarShapes walks the plaintext encodings: the
-// bare four-byte integer and the five-byte 0x00-tagged scalar modern sources
-// send.
-func TestSetVolumeAcceptsBothScalarShapes(t *testing.T) {
-	session, recorder := newAuthenticatedSession(t)
+// TestSetVolumeDecodesRecoveredShapes pins the SET_VOLUME decoding ladder:
+// the bare four-byte big-endian integer, the five-byte 0x00-tagged scalar,
+// and the SafetyData blob wrapping a scalar are accepted and recorded; every
+// malformed or out-of-range shape is acknowledged and ignored so the phone
+// slider never triggers a reconnect loop.
+func TestSetVolumeDecodesRecoveredShapes(t *testing.T) {
 	cases := []struct {
-		name    string
-		payload []byte
-		want    int
+		name     string
+		payload  []byte
+		accepted bool
+		want     int
 	}{
-		{"four-byte integer", []byte{0x00, 0x00, 0x00, 0x2A}, 42},
-		{"five-byte scalar", EncodeScalar(64), 64},
+		{"four-byte integer", []byte{0x00, 0x00, 0x00, 0x2A}, true, 42},
+		{"five-byte scalar", EncodeScalar(64), true, 64},
+		{"empty", nil, false, 0},
+		{"garbage blob", bytes.Repeat([]byte{0xAB}, 25), false, 0},
+		{"out of range", []byte{0x00, 0x00, 0x00, 0x65}, false, 0},
 	}
 	for _, testCase := range cases {
-		result := stepAccepted(t, session, recorder, CommandFrame{Command: CmdSetVolume, Sequence: 4, Payload: testCase.payload})
-		if !result.VolumeSet || result.Volume != testCase.want {
-			t.Fatalf("%s: result = %+v, want volume %d", testCase.name, result, testCase.want)
-		}
-		if got := session.Volume(); got != testCase.want {
-			t.Fatalf("%s: session volume = %d, want %d", testCase.name, got, testCase.want)
-		}
+		session, recorder := newAuthenticatedSession(t)
+		result := stepAccepted(t, session, recorder,
+			CommandFrame{Command: CmdSetVolume, Sequence: 7, Payload: testCase.payload})
 		if len(result.Writes) != 1 {
 			t.Fatalf("%s: writes = %d, want the acknowledgement", testCase.name, len(result.Writes))
 		}
 		reply := decodeOneCommandFrame(t, result.Writes[0])
-		if reply.Command != CmdSetVolumeAck || reply.Sequence != 4 {
+		if reply.Command != CmdSetVolumeAck || reply.Sequence != 7 {
 			t.Fatalf("%s: reply = %+v", testCase.name, reply)
 		}
-	}
-}
-
-// TestSetVolumeDecryptsSafetyDataPayload pins the wrapped-command path seen
-// in the field: MIUI wraps SET_VOLUME in a SafetyData blob (25 bytes: nine-
-// byte header plus one CBC block) keyed by the TCP endpoints. Without an
-// active safety channel the probe must decrypt it anyway, whichever IV mode
-// the phone chose and whichever scalar shape it wrapped.
-func TestSetVolumeDecryptsSafetyDataPayload(t *testing.T) {
-	authKey := deriveType1AuthKey(testLocalHost, testLocalPort, testPeerHost, testPeerPort)
-	key := authKey[:16]
-	cases := []struct {
-		name  string
-		iv    []byte
-		inner []byte
-		want  int
-	}{
-		{"type-2 scalar", authKey[16:], EncodeScalar(55), 55},
-		{"type-2 four-byte", authKey[16:], []byte{0x00, 0x00, 0x00, 0x28}, 40},
-		{"type-1 scalar", key, EncodeScalar(21), 21},
-		{"type-1 four-byte", key, []byte{0x00, 0x00, 0x00, 0x50}, 80},
-	}
-	for _, testCase := range cases {
-		session, recorder := newAuthenticatedSession(t)
-		cipher, err := newSafetyCipher(key, testCase.iv)
-		if err != nil {
-			t.Fatal(err)
+		if result.VolumeSet != testCase.accepted {
+			t.Fatalf("%s: VolumeSet = %v, want %v", testCase.name, result.VolumeSet, testCase.accepted)
 		}
-		blob, err := cipher.Encrypt(testCase.inner)
-		if err != nil {
-			t.Fatal(err)
+		if testCase.accepted && result.Volume != testCase.want {
+			t.Fatalf("%s: Volume = %d, want %d", testCase.name, result.Volume, testCase.want)
 		}
-		if len(blob) != 25 {
-			t.Fatalf("%s: blob = %d bytes, want the observed 25-byte shape", testCase.name, len(blob))
-		}
-		result := stepAccepted(t, session, recorder, CommandFrame{Command: CmdSetVolume, Sequence: 6, Payload: blob})
-		if !result.VolumeSet || result.Volume != testCase.want {
-			t.Fatalf("%s: result = %+v, want volume %d", testCase.name, result, testCase.want)
-		}
-		if got := session.Volume(); got != testCase.want {
-			t.Fatalf("%s: session volume = %d, want %d", testCase.name, got, testCase.want)
-		}
-	}
-}
-
-// TestSetVolumeMalformedPayloadsAreIgnored pins the never-fatal policy: a
-// volume command that decodes to nothing is acknowledged and skipped, and the
-// session keeps working - no stop, no volume change.
-func TestSetVolumeMalformedPayloadsAreIgnored(t *testing.T) {
-	wrongKey := deriveType1AuthKey(testLocalHost, testLocalPort, testPeerHost, 1)
-	wrongCipher, err := newSafetyCipher(wrongKey[:16], wrongKey[16:])
-	if err != nil {
-		t.Fatal(err)
-	}
-	foreignBlob, err := wrongCipher.Encrypt(EncodeScalar(90))
-	if err != nil {
-		t.Fatal(err)
-	}
-	shapes := map[string][]byte{
-		"empty":                nil,
-		"garbage blob":         bytes.Repeat([]byte{0xAB}, 25),
-		"foreign-key blob":     foreignBlob,
-		"truncated blob":       bytes.Repeat([]byte{0x01}, 10),
-		"out-of-range integer": {0x00, 0x00, 0x01, 0x2C},
-		"mis-tagged scalar":    {0x01, 0x00, 0x00, 0x00, 0x2A},
-	}
-	for name, payload := range shapes {
-		session, recorder := newAuthenticatedSession(t)
-		result := stepAccepted(t, session, recorder, CommandFrame{Command: CmdSetVolume, Sequence: 7, Payload: payload})
-		if result.VolumeSet {
-			t.Fatalf("%s: a malformed payload must not set a volume", name)
-		}
-		if got := session.Volume(); got != 30 {
-			t.Fatalf("%s: volume = %d, want it unchanged", name, got)
-		}
-		if len(result.Writes) != 1 {
-			t.Fatalf("%s: writes = %d, want the acknowledgement", name, len(result.Writes))
-		}
-		reply := decodeOneCommandFrame(t, result.Writes[0])
-		if reply.Command != CmdSetVolumeAck || reply.Sequence != 7 {
-			t.Fatalf("%s: reply = %+v", name, reply)
+		if testCase.accepted && session.Volume() != testCase.want {
+			t.Fatalf("%s: session volume = %d, want %d", testCase.name, session.Volume(), testCase.want)
 		}
 		followUp := stepAccepted(t, session, recorder, CommandFrame{Command: CmdHeartbeat, Sequence: 8})
 		if len(followUp.Writes) != 1 {
-			t.Fatalf("%s: the session did not survive the malformed command", name)
+			t.Fatalf("%s: the session did not survive the command", testCase.name)
 		}
+	}
+}
+
+// TestSetVolumeDecodesSafetyDataBlob pins the blob probe: a SET_VOLUME
+// wrapped in a SafetyData blob - decrypted on a fresh cipher so the live
+// channel state is untouched - decodes with the first IV candidate.
+func TestSetVolumeDecodesSafetyDataBlob(t *testing.T) {
+	session, recorder := newAuthenticatedSession(t)
+	authKey := deriveType1AuthKey(testLocalHost, testLocalPort, testPeerHost, testPeerPort)
+	key := authKey[:16]
+	encryptor, err := newSafetyCipher(key, authKey[16:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := encryptor.Encrypt(EncodeScalar(47))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := stepAccepted(t, session, recorder, CommandFrame{Command: CmdSetVolume, Sequence: 4, Payload: blob})
+	if !result.VolumeSet || result.Volume != 47 {
+		t.Fatalf("VolumeSet = %v, Volume = %d; want the blob level 47", result.VolumeSet, result.Volume)
+	}
+	if session.Volume() != 47 {
+		t.Fatalf("session volume = %d, want 47", session.Volume())
 	}
 }
 

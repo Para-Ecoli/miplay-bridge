@@ -30,13 +30,11 @@ type Hooks struct {
 	Claim func() error
 	// Release frees the realtime output slot. Must be idempotent.
 	Release func()
-	// SetVolume mirrors the phone's SET_VOLUME onto the hardware mixer.
+	// SetVolume mirrors the phone's SET_VOLUME onto the hardware mixer. It is
+	// fire-and-forget: a failing write is logged but never ends the session.
 	SetVolume func(percent int)
 	// Volume reports the live hardware volume percentage; ok is false when no
-	// hardware mixer is available. A new control session starts from this
-	// level and GET_VOLUME answers it, so the phone follows the real mixer
-	// instead of the configured default. It is invoked while the session lock
-	// is held, so it must not call back into the receiver.
+	// mixer is wired or the level cannot be read.
 	Volume func() (int, bool)
 }
 
@@ -210,16 +208,16 @@ func (r *Receiver) acceptLoop(ctx context.Context) {
 
 // sessionVolume is the level a new control session starts from: the live
 // hardware volume when a mixer is wired, else the configured default.
-// Starting from the configured default made every reconnect - or second
-// control connection - report a level nobody set, which snapped the phone's
-// slider back after a console or phone volume change.
+// Starting from a fixed default made every reconnect - or second control
+// connection - report a level nobody set, which snapped the phone's slider
+// back after a console or phone volume change.
 func (r *Receiver) sessionVolume() int {
 	if r.hooks.Volume != nil {
 		if current, ok := r.hooks.Volume(); ok && current >= 0 && current <= 100 {
 			return current
 		}
 	}
-	return r.cfg.DefaultVolume
+	return r.cfg.VolumeDefault
 }
 
 // handleControl runs one control connection end to end.
@@ -306,10 +304,13 @@ func (r *Receiver) handleControl(ctx context.Context, connection net.Conn) {
 				break
 			}
 			if result.VolumeSet {
+				// The protocol volume is authoritative for the current source:
+				// mirror it onto the hardware mixer. A failed write only warns; the
+				// session stays alive so the slider never triggers a reconnect loop.
 				if r.hooks.SetVolume != nil {
-					// The protocol volume is authoritative for the current
-					// source; mirror it onto the hardware mixer.
 					r.hooks.SetVolume(result.Volume)
+				} else {
+					r.logger.Debug("miplay volume change ignored: no hardware mixer is wired", "volume", result.Volume)
 				}
 			}
 			if result.PauseRequested {
@@ -628,8 +629,8 @@ func (r *Receiver) Status() Status {
 	if report.session != nil {
 		status.SourceName = report.session.SourceName()
 		if r.hooks.Volume == nil {
-			// Without a live mixer the session's own copy is the only
-			// source of truth available.
+			// Without a live mixer the session's own copy is the only source
+			// of truth available.
 			status.Volume = report.session.Volume()
 		}
 		status.Safety = report.session.SafetyDiagnostics()
