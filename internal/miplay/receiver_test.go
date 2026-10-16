@@ -1,10 +1,12 @@
 package miplay
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,10 +23,14 @@ type controlTestHarness struct {
 }
 
 func newControlTestHarness(t *testing.T, handshakeTimeout time.Duration) *controlTestHarness {
+	return newControlTestHarnessWithHooks(t, handshakeTimeout, Hooks{})
+}
+
+func newControlTestHarnessWithHooks(t *testing.T, handshakeTimeout time.Duration, hooks Hooks) *controlTestHarness {
 	t.Helper()
 	cfg := config.Default()
 	cfg.MiPlayHandshakeTimeout = handshakeTimeout
-	receiver := NewReceiver(cfg, discardLogger(), Hooks{})
+	receiver := NewReceiver(cfg, discardLogger(), hooks)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -127,6 +133,78 @@ func TestControlHandshakeTimeoutGuardsUnauthenticatedConnections(t *testing.T) {
 	summary := harness.lastSession(t)
 	if summary == nil || summary.Error != "handshake timed out" {
 		t.Fatalf("summary = %+v, want a handshake timeout", summary)
+	}
+}
+
+// TestControlVolumeFollowsTheHardwareMixer pins the receiver-level volume
+// contract behind the phone-slider spring-back fix: a fresh control
+// connection starts from the live hardware level (not the configured
+// default), a level change from outside the phone is answered on the very
+// next query, and SET_VOLUME still mirrors onto the hardware through the
+// hook.
+func TestControlVolumeFollowsTheHardwareMixer(t *testing.T) {
+	var levelMu sync.Mutex
+	level := 37
+	available := true
+	mirrored := make(chan int, 4)
+	hooks := Hooks{
+		Volume: func() (int, bool) {
+			levelMu.Lock()
+			defer levelMu.Unlock()
+			return level, available
+		},
+		SetVolume: func(percent int) { mirrored <- percent },
+	}
+	harness := newControlTestHarnessWithHooks(t, time.Second, hooks)
+	harness.authenticate(t)
+
+	// The session started from the live hardware level: even when the live
+	// reader is gone, the first query answers 37 - not the configured
+	// default (80).
+	levelMu.Lock()
+	available = false
+	levelMu.Unlock()
+	if _, err := harness.client.Write(EncodeCommand(CmdGetVolume, 3, nil)); err != nil {
+		t.Fatalf("write get volume: %v", err)
+	}
+	frame := readCommandFrame(t, harness.client)
+	if frame.Command != CmdGetVolumeAck || frame.Sequence != 3 || !bytes.Equal(frame.Payload, EncodeScalar(37)) {
+		t.Fatalf("reply = %+v, want the starting hardware level 37", frame)
+	}
+
+	// The console moves the volume: the next query follows immediately.
+	levelMu.Lock()
+	available = true
+	level = 12
+	levelMu.Unlock()
+	if _, err := harness.client.Write(EncodeCommand(CmdGetVolume, 4, nil)); err != nil {
+		t.Fatalf("write get volume: %v", err)
+	}
+	frame = readCommandFrame(t, harness.client)
+	if !bytes.Equal(frame.Payload, EncodeScalar(12)) {
+		t.Fatalf("reply payload = % x, want the updated live level 12", frame.Payload)
+	}
+
+	// SET_VOLUME is still acknowledged and mirrored onto the hardware.
+	if _, err := harness.client.Write(EncodeCommand(CmdSetVolume, 5, EncodeScalar(64))); err != nil {
+		t.Fatalf("write set volume: %v", err)
+	}
+	frame = readCommandFrame(t, harness.client)
+	if frame.Command != CmdSetVolumeAck || frame.Sequence != 5 {
+		t.Fatalf("reply = %+v, want the set-volume acknowledgement", frame)
+	}
+	select {
+	case got := <-mirrored:
+		if got != 64 {
+			t.Fatalf("mirrored volume = %d, want 64", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SET_VOLUME never reached the hardware hook")
+	}
+
+	// The status slice reports the live level, not a stale session copy.
+	if status := harness.receiver.Status(); status.Volume != 12 {
+		t.Fatalf("status volume = %d, want the live level 12", status.Volume)
 	}
 }
 

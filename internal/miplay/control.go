@@ -68,6 +68,11 @@ type LegacyReceiverSession struct {
 	challengeSequence uint16
 	friendlyName      string
 	volume            int
+	// volumeProvider, when wired, reports the live hardware volume. The
+	// session answers GET_VOLUME with it so a level the console changed after
+	// the phone connected is reported truthfully. Invoked with the session
+	// lock held.
+	volumeProvider func() (int, bool)
 
 	phase             ControlPhase
 	authenticated     bool
@@ -157,6 +162,14 @@ func (s *LegacyReceiverSession) Volume() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.volume
+}
+
+// SetVolumeProvider wires the live hardware-volume reader used to answer
+// GET_VOLUME. A nil provider keeps the session's own copy authoritative.
+func (s *LegacyReceiverSession) SetVolumeProvider(provider func() (int, bool)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.volumeProvider = provider
 }
 
 // SafetyDiagnostics reports the encrypted-channel state, when active.
@@ -413,21 +426,36 @@ func (s *LegacyReceiverSession) processBusiness(frame CommandFrame) (ControlResu
 		return s.emptyQueryAck(frame, CmdGetMirrorModeAck, EncodeScalar(2))
 
 	case CmdGetVolume:
-		return s.emptyQueryAck(frame, CmdGetVolumeAck, EncodeScalar(uint32(s.volume)))
+		// Answer with the current volume no matter what the inbound payload
+		// carries: the request is a pure query (the reply is the payload), so
+		// the request shape decides nothing - a modern source may wrap it in a
+		// SafetyData blob - and a volume query must never end a session. A
+		// wired provider answers the live hardware level, so the reply tracks
+		// console-side changes too and the phone's slider never springs back
+		// to a stale value.
+		return s.ack(CmdGetVolumeAck, frame.Sequence, EncodeScalar(uint32(s.currentVolume()))), nil
 
 	case CmdSetVolume:
-		if len(frame.Payload) != 4 {
-			return s.stop("setVolume payload must be a four-byte integer")
+		// The payload arrives in one of two recovered shapes: the bare
+		// four-byte big-endian integer of earlier firmware, or the five-byte
+		// 0x00-tagged scalar modern MIUI sends (the EncodeScalar shape every
+		// other volume message uses). A modern source additionally wraps the
+		// command in a SafetyData blob; through an active safety channel the
+		// blob is decrypted before this handler runs, and without one
+		// decodeVolumePayload probes it directly.
+		//
+		// A malformed or undecryptable volume command is acknowledged and
+		// ignored, never fatal: the CBC IV takes a moment to settle on the
+		// encrypted channel, and tearing the session down every time the
+		// slider moves leaves the phone in a reconnect loop.
+		if volume, ok := s.decodeVolumePayload(frame.Payload); ok {
+			s.volume = volume
+			result := s.ack(CmdSetVolumeAck, frame.Sequence, nil)
+			result.VolumeSet = true
+			result.Volume = volume
+			return result, nil
 		}
-		volume := int(binary.BigEndian.Uint32(frame.Payload))
-		if volume < 0 || volume > 100 {
-			return s.stop("volume out of range")
-		}
-		s.volume = volume
-		result := s.ack(CmdSetVolumeAck, frame.Sequence, nil)
-		result.VolumeSet = true
-		result.Volume = volume
-		return result, nil
+		return s.ack(CmdSetVolumeAck, frame.Sequence, nil), nil
 
 	case CmdGetState:
 		state := uint32(3)
@@ -513,6 +541,69 @@ func (s *LegacyReceiverSession) captureMediaInfo(payload map[string]any) {
 			}
 		}
 	}
+}
+
+// decodeVolumePayload reads a SET_VOLUME payload in any of the recovered
+// shapes: a bare scalar, or a SafetyData blob wrapping a scalar. The blob
+// probe re-derives the protocol key material from the TCP endpoints and tries
+// the two recovered IV candidates in the same order as
+// NewModernSafetyReceiver. It runs on a fresh cipher and never mutates the
+// live safety channel, so a blob the channel itself will handle later is not
+// disturbed, and a probe miss just leaves the command ignored.
+func (s *LegacyReceiverSession) decodeVolumePayload(payload []byte) (int, bool) {
+	if volume, ok := decodeVolumeScalar(payload); ok {
+		return volume, true
+	}
+	if s.localHost == "" || s.peerHost == "" {
+		return 0, false
+	}
+	authKey := deriveType1AuthKey(s.localHost, s.localPort, s.peerHost, s.peerPort)
+	key := authKey[:16]
+	for _, iv := range [][]byte{authKey[16:], key} {
+		cipher, err := newSafetyCipher(key, iv)
+		if err != nil {
+			continue
+		}
+		plaintext, err := cipher.Decrypt(payload)
+		if err != nil {
+			continue
+		}
+		if volume, ok := decodeVolumeScalar(plaintext); ok {
+			return volume, true
+		}
+	}
+	return 0, false
+}
+
+// decodeVolumeScalar reads a volume in 0..100 from either recovered scalar
+// shape: a four-byte big-endian integer, or the five-byte 0x00-tagged scalar.
+// Out-of-range values are rejected so a malformed frame is skipped instead of
+// clamping the mixer.
+func decodeVolumeScalar(payload []byte) (int, bool) {
+	switch {
+	case len(payload) == 4:
+	case len(payload) == 5 && payload[0] == 0:
+		payload = payload[1:]
+	default:
+		return 0, false
+	}
+	value := binary.BigEndian.Uint32(payload)
+	if value > 100 {
+		return 0, false
+	}
+	return int(value), true
+}
+
+// currentVolume resolves the level GET_VOLUME answers with: the live hardware
+// level when a provider is wired and reports a sane value, else the session's
+// own copy. The caller must hold mu.
+func (s *LegacyReceiverSession) currentVolume() int {
+	if s.volumeProvider != nil {
+		if volume, ok := s.volumeProvider(); ok && volume >= 0 && volume <= 100 {
+			return volume
+		}
+	}
+	return s.volume
 }
 
 func (s *LegacyReceiverSession) emptyQueryAck(frame CommandFrame, command Command, payload []byte) (ControlResult, error) {

@@ -430,6 +430,49 @@ func (m *Mixer) Refresh(ctx context.Context) (State, error) {
 	return m.State(), nil
 }
 
+// ControlState is one simple mixer control's live state, as the console shows
+// it: a playback percent, a switch, and/or an enum item.
+type ControlState struct {
+	Name      string   `json:"name"`
+	Volume    int      `json:"volume_percent"`
+	HasVolume bool     `json:"has_volume"`
+	Muted     bool     `json:"muted"`
+	HasSwitch bool     `json:"has_switch"`
+	Items     []string `json:"items,omitempty"`
+	Item      string   `json:"item,omitempty"`
+	Error     string   `json:"error,omitempty"`
+}
+
+// Snapshot reads the live state of every discovered control so the console can
+// offer the same adjustable surface as alsamixer's playback view. Controls
+// without any playback volume, playback switch or enum item (capture-only
+// ones) are skipped, exactly as the playback view leaves them out.
+func (m *Mixer) Snapshot(ctx context.Context) []ControlState {
+	controls := m.State().Controls
+	states := make([]ControlState, 0, len(controls))
+	for _, name := range controls {
+		entry := ControlState{Name: name}
+		output, err := m.SimpleGet(ctx, name)
+		if err != nil {
+			entry.Error = err.Error()
+			states = append(states, entry)
+			continue
+		}
+		entry.Volume, entry.HasVolume, entry.Muted, entry.HasSwitch = playbackState(output)
+		if items := ParseItems(output); len(items) > 0 {
+			entry.Items = items
+			if item, ok := ParseItemValue(output, 0); ok {
+				entry.Item = item
+			}
+		}
+		if !entry.HasVolume && !entry.HasSwitch && len(entry.Items) == 0 {
+			continue
+		}
+		states = append(states, entry)
+	}
+	return states
+}
+
 // ---------------------------------------------------------------------------
 // amixer output parsing (pure helpers, unit tested)
 // ---------------------------------------------------------------------------
@@ -481,6 +524,65 @@ func ParseItemValue(output string, index int) (string, bool) {
 		return rest[start+1 : start+1+end], true
 	}
 	return "", false
+}
+
+// ParseItems reads the `Items: 'A' 'B' ...` line of an enum control's
+// `amixer sget` output into the list of possible values.
+func ParseItems(output string) []string {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "Items:") {
+			continue
+		}
+		var items []string
+		for index, part := range strings.Split(strings.TrimPrefix(line, "Items:"), "'") {
+			if index%2 == 1 && part != "" {
+				items = append(items, part)
+			}
+		}
+		return items
+	}
+	return nil
+}
+
+// playbackState scans an `amixer sget` block for the playback direction, the
+// way alsamixer's default view shows it: the percent comes from `[NN%]` tokens
+// and the switch from `[on]`/`[off]` tokens, both only on Playback lines, so a
+// capture-only control reports nothing adjustable.
+func playbackState(output string) (percent int, hasPercent bool, muted bool, hasSwitch bool) {
+	for _, line := range strings.Split(output, "\n") {
+		if !strings.Contains(line, "Playback") {
+			continue
+		}
+		rest := line
+		for {
+			open := strings.Index(rest, "[")
+			if open < 0 {
+				break
+			}
+			closeIndex := strings.Index(rest[open:], "]")
+			if closeIndex < 0 {
+				break
+			}
+			token := rest[open+1 : open+closeIndex]
+			if strings.HasSuffix(token, "%") {
+				if value, err := strconv.Atoi(strings.TrimSuffix(token, "%")); err == nil {
+					percent = value
+					hasPercent = true
+				}
+			}
+			switch token {
+			case "on":
+				muted = false
+				hasSwitch = true
+			case "off":
+				muted = true
+				hasSwitch = true
+			}
+			rest = rest[open+closeIndex+1:]
+		}
+	}
+	return percent, hasPercent, muted, hasSwitch
 }
 
 // ParsePercent reads the last `[NN%]` value in an `amixer sget` output.

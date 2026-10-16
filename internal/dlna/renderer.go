@@ -527,6 +527,9 @@ func (r *Renderer) handleRenderingControl(w http.ResponseWriter, request *http.R
 	defer cancel()
 	switch action {
 	case "GetVolume":
+		// Re-read the hardware control first: a controller opening its volume
+		// UI must see the live level, not a stale snapshot.
+		r.player.RefreshVolume(ctx)
 		volume, _ := r.player.Volume()
 		if volume < 0 {
 			volume = 0
@@ -549,6 +552,7 @@ func (r *Renderer) handleRenderingControl(w http.ResponseWriter, request *http.R
 		_ = applied
 		writeSOAPResponse(w, renderingControlService, action, nil)
 	case "GetMute":
+		r.player.RefreshVolume(ctx)
 		_, muted := r.player.Volume()
 		value := "0"
 		if muted {

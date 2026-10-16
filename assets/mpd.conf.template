@@ -9,9 +9,10 @@
 #   · 不设置 format          让 MPD 按曲目实际采样率打开设备（设死会强制重采样）
 #   · bind_to_address 127.0.0.1  MPD 控制口只给同容器的自研外壳使用，不对局域网暴露
 #
-# 音量：mixer_type "hardware" + mixer_control 指向宿主实际存在的 simple mixer
-# 控件（本机为 Headphone）。若该控件不存在（例如某些 USB DAC），外壳会自动
-# 回退为 software mixer，避免 MPD 因找不到控件而拒绝启动。
+# 音量：mixer_type "hardware" + mixer_control 指向与外壳混音器完全相同的
+# 那一个 simple mixer 控件（即 effective control，本机为 Headphone），保证 MPD、
+# 控制台、妙播三方读写同一个控件。若该控件不存在（例如某些 USB DAC），外壳
+# 会自动回退为 software mixer，避免 MPD 因找不到控件而拒绝启动。
 #
 # 注意：妙播实时管线不经 MPD（ffmpeg | aplay 直出），本配置服务 DLNA 投音与
 # REST API 的 URL 播放。

@@ -3,6 +3,7 @@ package api
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/miplay-bridge/miplay-bridge/internal/alsa"
+	"github.com/miplay-bridge/miplay-bridge/internal/alsa/alsatest"
 	"github.com/miplay-bridge/miplay-bridge/internal/config"
 	"github.com/miplay-bridge/miplay-bridge/internal/dlna"
 	"github.com/miplay-bridge/miplay-bridge/internal/miplay"
@@ -666,6 +668,147 @@ func TestVolumeEndpoint(t *testing.T) {
 	if payload := decodeJSON(t, recorder); payload["code"] != "mpd_unavailable" {
 		t.Fatalf("payload = %v", payload)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// mixer control endpoint
+// ---------------------------------------------------------------------------
+
+// TestMixerControlEndpointAdjustsRawControls pins the console's hardware
+// mixer panel contract: every control the card exposes can be adjusted by
+// name the way alsamixer does, while the effective control's volume and
+// switch stay routed through the engine so the kernel mirror keeps up.
+func TestMixerControlEndpointAdjustsRawControls(t *testing.T) {
+	h := newHarness(t)
+	fake := alsatest.New()
+	mixer := alsa.New(h.cfg, h.logger).WithRunner(fake.Run)
+	if _, err := mixer.Init(context.Background()); err != nil {
+		t.Fatalf("mixer init: %v", err)
+	}
+	engine := output.New(h.cfg, h.logger, h.engine.Manager(), mixer)
+	handler := h.routes(func(options *Options) {
+		options.Mixer = mixer
+		options.Engine = engine
+	})
+	if effective := mixer.State().EffectiveControl; effective != "Headphone" {
+		t.Fatalf("effective control = %q, want Headphone", effective)
+	}
+
+	// The effective control's volume is the system volume: it reaches the
+	// hardware and is mirrored into the kernel.
+	recorder := do(t, handler, "POST", "/api/mixer", map[string]any{"name": "Headphone", "volume": 42}, nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("headphone status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if got := fake.PercentOf("Headphone"); got != 42 {
+		t.Fatalf("headphone control = %d, want 42", got)
+	}
+	if got := lastCommands(mutatingCommands(h.kernel.recorded()), 1); !equalStrings(got, []string{"setvol 42"}) {
+		t.Fatalf("kernel commands = %v, want setvol 42", got)
+	}
+
+	// Any other control is written straight to the card and never touches the
+	// kernel.
+	before := mutatingCommands(h.kernel.recorded())
+	recorder = do(t, handler, "POST", "/api/mixer", map[string]any{"name": "Master", "volume": 33}, nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("master status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if got := fake.PercentOf("Master"); got != 33 {
+		t.Fatalf("master control = %d, want 33", got)
+	}
+	if after := mutatingCommands(h.kernel.recorded()); !equalStrings(after, before) {
+		t.Fatalf("kernel commands changed: %v -> %v", before, after)
+	}
+
+	// Switches work per control, on and off.
+	if recorder := do(t, handler, "POST", "/api/mixer", map[string]any{"name": "Speaker", "muted": true}, nil); recorder.Code != http.StatusOK {
+		t.Fatalf("speaker mute status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if got := fake.Switch("Speaker"); got != "off" {
+		t.Fatalf("speaker switch = %q, want off", got)
+	}
+	if recorder := do(t, handler, "POST", "/api/mixer", map[string]any{"name": "Speaker", "muted": false}, nil); recorder.Code != http.StatusOK {
+		t.Fatalf("speaker unmute status = %d", recorder.Code)
+	}
+	if got := fake.Switch("Speaker"); got != "on" {
+		t.Fatalf("speaker switch = %q, want on", got)
+	}
+
+	// The effective control's switch goes through the engine as well, exactly
+	// like /api/volume.
+	if recorder := do(t, handler, "POST", "/api/mixer", map[string]any{"name": "Headphone", "muted": true}, nil); recorder.Code != http.StatusOK {
+		t.Fatalf("headphone mute status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if got := fake.Switch("Headphone"); got != "off" {
+		t.Fatalf("headphone switch = %q, want off", got)
+	}
+	if recorder := do(t, handler, "POST", "/api/mixer", map[string]any{"name": "Headphone", "muted": false}, nil); recorder.Code != http.StatusOK {
+		t.Fatalf("headphone unmute status = %d", recorder.Code)
+	}
+
+	// Enum controls take their item values.
+	recorder = do(t, handler, "POST", "/api/mixer", map[string]any{"name": "Auto-Mute Mode", "item": "Enabled"}, nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("auto-mute status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if got := fake.Item(); got != "Enabled" {
+		t.Fatalf("auto-mute item = %q, want Enabled", got)
+	}
+
+	// Validation: unknown controls, out-of-range volumes and empty requests
+	// are refused before touching the card.
+	if recorder := do(t, handler, "POST", "/api/mixer", map[string]any{"volume": 10}, nil); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("missing name status = %d", recorder.Code)
+	}
+	if recorder := do(t, handler, "POST", "/api/mixer", map[string]any{"name": "Nope", "volume": 10}, nil); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("unknown control status = %d", recorder.Code)
+	}
+	if recorder := do(t, handler, "POST", "/api/mixer", map[string]any{"name": "Master", "volume": 150}, nil); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("out-of-range status = %d", recorder.Code)
+	}
+	if recorder := do(t, handler, "POST", "/api/mixer", map[string]any{"name": "Master"}, nil); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("empty request status = %d", recorder.Code)
+	}
+	if recorder := do(t, handler, "POST", "/api/mixer", map[string]any{"name": "Master", "item": "  "}, nil); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("blank item status = %d", recorder.Code)
+	}
+
+	// Without a mixer the endpoint is unavailable, not a panic.
+	withoutMixer := h.routes(func(options *Options) { options.Mixer = nil })
+	if recorder := do(t, withoutMixer, "POST", "/api/mixer", map[string]any{"name": "Master", "volume": 10}, nil); recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("no-mixer status = %d", recorder.Code)
+	}
+
+	// The console's status payload carries the full adjustable surface.
+	payload := decodeJSON(t, do(t, handler, "GET", "/api/status", nil, nil))
+	controls, _ := payload["mixer_controls"].([]any)
+	if len(controls) != 4 {
+		t.Fatalf("mixer_controls = %v", payload["mixer_controls"])
+	}
+	headphone := controlByName(controls, "Headphone")
+	if headphone == nil || headphone["volume_percent"] != float64(42) || headphone["muted"] != false {
+		t.Fatalf("headphone entry = %v", headphone)
+	}
+	autoMute := controlByName(controls, "Auto-Mute Mode")
+	if autoMute == nil || autoMute["item"] != "Enabled" {
+		t.Fatalf("auto-mute entry = %v", autoMute)
+	}
+	items, _ := autoMute["items"].([]any)
+	if !containsString(items, "Disabled") || !containsString(items, "Enabled") {
+		t.Fatalf("auto-mute items = %v", autoMute["items"])
+	}
+}
+
+// controlByName finds one mixer_controls entry in the status payload.
+func controlByName(controls []any, name string) map[string]any {
+	for _, raw := range controls {
+		entry, _ := raw.(map[string]any)
+		if entry["name"] == name {
+			return entry
+		}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

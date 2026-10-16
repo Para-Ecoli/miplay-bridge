@@ -149,7 +149,13 @@ func run() error {
 		logger.Error("could not load the MPD configuration template", "error", err)
 		return &exitError{code: exitKernelFailed, err: err}
 	}
-	manager.SetMixerControl(mixerControlFor(report, cfg, mixerState.EffectiveControl))
+	volumeControl := mixerControlFor(report, cfg, mixerState.EffectiveControl)
+	manager.SetMixerControl(volumeControl)
+	if volumeControl != "" {
+		logger.Info("mpd volume control bound to the hardware mixer", "control", volumeControl)
+	} else {
+		logger.Warn("mpd has no hardware mixer control; its volume falls back to software mixing", "hint", "set MPD_MIXER_CONTROL to a control the card exposes")
+	}
 	if err := manager.Start(ctx); err != nil {
 		logger.Error("could not start the MPD playback kernel", "error", err)
 		return &exitError{code: exitKernelFailed, err: err}
@@ -280,24 +286,39 @@ func miplayHooks(engine *output.Engine, logger *slog.Logger) miplay.Hooks {
 				logger.Warn("could not mirror the miplay volume onto the hardware mixer", "error", err, "volume", percent)
 			}
 		},
+		// Volume answers the protocol volume paths - the level a new control
+		// session starts from and every GET_VOLUME - from the hardware mixer
+		// the console and DLNA read. Each read re-reads the actual ALSA control
+		// first, so the phone always sees the live level and the slider cannot
+		// spring back to a stale snapshot.
+		Volume: func() (int, bool) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			engine.RefreshVolume(ctx)
+			return engine.VolumeLevel()
+		},
 	}
 }
 
-// mixerControlFor decides whether MPD may use a hardware mixer. MPD refuses to
-// start when a configured hardware mixer control does not exist, so an absent
-// control degrades to MPD's software mixer instead of a crash loop.
+// mixerControlFor decides whether MPD may use a hardware mixer. The volume
+// authority is the ALSA control the engine's mixer drives (effectiveControl),
+// so MPD must drive that very control: with a different one, MPD's mirror of
+// the level and the actual hardware attenuation would diverge (two controls in
+// series). MPD refuses to start when a configured hardware mixer control does
+// not exist, so an absent control degrades to MPD's software mixer instead of
+// a crash loop.
 func mixerControlFor(report alsa.Report, cfg config.Config, effectiveControl string) string {
-	if strings.TrimSpace(cfg.MPDMixerControl) != "" {
-		for _, control := range report.ControlNames {
-			if control == cfg.MPDMixerControl {
-				return cfg.MPDMixerControl
-			}
-		}
-	}
 	if effectiveControl != "" {
 		for _, control := range report.ControlNames {
 			if control == effectiveControl {
 				return effectiveControl
+			}
+		}
+	}
+	if strings.TrimSpace(cfg.MPDMixerControl) != "" {
+		for _, control := range report.ControlNames {
+			if control == cfg.MPDMixerControl {
+				return cfg.MPDMixerControl
 			}
 		}
 	}

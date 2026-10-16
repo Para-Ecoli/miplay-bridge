@@ -67,6 +67,54 @@ func TestParsePercentAndSwitchState(t *testing.T) {
 	}
 }
 
+func TestParseItems(t *testing.T) {
+	output := `Simple mixer control 'Auto-Mute Mode',0
+  Capabilities: enum
+  Items: 'Disabled' 'Enabled'
+  Item0: 'Disabled'
+`
+	items := ParseItems(output)
+	if len(items) != 2 || items[0] != "Disabled" || items[1] != "Enabled" {
+		t.Fatalf("ParseItems = %v", items)
+	}
+	if items := ParseItems("Simple mixer control 'Master',0\n"); items != nil {
+		t.Fatalf("ParseItems on a plain control = %v, want nil", items)
+	}
+}
+
+// TestSnapshotMirrorsThePlaybackView pins the console panel contract: the
+// snapshot reports every control alsamixer's playback view exposes, parses
+// its percent/switch/enum state, and skips capture-only controls.
+func TestSnapshotMirrorsThePlaybackView(t *testing.T) {
+	fake := newFakeAmixer()
+	fake.controls = append(fake.controls, "Mic")
+	mixer := New(testConfig(), testLogger()).WithRunner(fake.run)
+	if _, err := mixer.Init(context.Background()); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	states := mixer.Snapshot(context.Background())
+	byName := make(map[string]ControlState, len(states))
+	for _, state := range states {
+		byName[state.Name] = state
+	}
+	if len(byName) != 4 {
+		t.Fatalf("snapshot = %+v; want the four playback-view controls", states)
+	}
+	if _, ok := byName["Mic"]; ok {
+		t.Fatal("capture-only controls must be skipped like alsamixer's playback view")
+	}
+
+	headphone := byName["Headphone"]
+	if !headphone.HasVolume || headphone.Volume != 80 || !headphone.HasSwitch || headphone.Muted || headphone.Error != "" {
+		t.Fatalf("Headphone = %+v", headphone)
+	}
+	automute := byName["Auto-Mute Mode"]
+	if automute.HasVolume || automute.HasSwitch || len(automute.Items) != 2 || automute.Item != "Disabled" {
+		t.Fatalf("Auto-Mute Mode = %+v", automute)
+	}
+}
+
 // fakeAmixer emulates the subset of alsa-utils the bridge uses.
 type fakeAmixer struct {
 	mu       sync.Mutex
@@ -115,6 +163,9 @@ func (f *fakeAmixer) run(_ context.Context, name string, args ...string) (string
 		switch control {
 		case "Auto-Mute Mode":
 			return fmt.Sprintf("Simple mixer control 'Auto-Mute Mode',0\n  Items: 'Disabled' 'Enabled'\n  Item0: '%s'\n", f.autoMute), "", nil
+		case "Mic":
+			// Capture-only: the playback view must leave it out.
+			return "Simple mixer control 'Mic',0\n  Mono: Capture 30 [50%] [0.00dB] [on]\n", "", nil
 		default:
 			return fmt.Sprintf("Simple mixer control '%s',0\n  Front Left: Playback %d [%d%%] [0.00dB] [%s]\n", control, f.percent[control], f.percent[control], f.switches[control]), "", nil
 		}

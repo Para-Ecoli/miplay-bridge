@@ -98,6 +98,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/play", s.guard(s.play))
 	mux.HandleFunc("POST /api/control", s.guard(s.control))
 	mux.HandleFunc("POST /api/volume", s.guard(s.volume))
+	mux.HandleFunc("POST /api/mixer", s.guard(s.mixerControl))
 	mux.HandleFunc("POST /api/test-play", s.guard(s.testPlay))
 
 	// One-click cast clearing for the embedded console and remote API callers.
@@ -334,7 +335,9 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, payload)
 }
 
-// playbackSnapshot reads live playback state from the kernel.
+// playbackSnapshot reads live playback state from the kernel. The volume
+// field reports the hardware mixer when one is initialised: the mixer is the
+// volume authority, and the kernel's cached number is only its mirror.
 func (s *Server) playbackSnapshot(ctx context.Context) (map[string]any, error) {
 	if s.client == nil {
 		return nil, mpd.ErrUnavailable
@@ -347,9 +350,13 @@ func (s *Server) playbackSnapshot(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	volume := atoiOr(status["volume"], -1)
+	if s.mixer != nil && s.mixer.State().Initialized {
+		volume = s.mixer.State().VolumePercent
+	}
 	playback := map[string]any{
 		"state":       status["state"],
-		"volume":      atoiOr(status["volume"], -1),
+		"volume":      volume,
 		"elapsed":     atofOr(status["elapsed"], 0),
 		"duration":    atofOr(status["duration"], 0),
 		"bitrate":     status["bitrate"],
@@ -373,6 +380,16 @@ func (s *Server) playbackSnapshot(ctx context.Context) (map[string]any, error) {
 
 // status returns the full bridge status.
 func (s *Server) status(w http.ResponseWriter, r *http.Request) {
+	// The console polls this endpoint every two seconds; re-read the hardware
+	// control first so the reported level tracks out-of-band changes (a
+	// host-side amixer invocation, the kernel's own mixer writes) instead of a
+	// stale snapshot. On failure the last snapshot is kept. The per-control
+	// snapshot below also pays one amixer read per control, hence the wider
+	// timeout.
+	refreshCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	s.refreshMixer(refreshCtx)
+	controls := s.mixerControls(refreshCtx)
+	cancel()
 	mixerState := alsa.State{}
 	if s.mixer != nil {
 		mixerState = s.mixer.State()
@@ -389,6 +406,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		"uptime_seconds":  int(time.Since(s.startedAt).Seconds()),
 		"sound_card":      s.report,
 		"mixer":           mixerState,
+		"mixer_controls":  controls,
 		"mpd":             kernel,
 		"playback":        playback,
 		"auto_mute_fixed": mixerState.AutoMuteFixed,

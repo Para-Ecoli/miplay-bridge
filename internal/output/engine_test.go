@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/miplay-bridge/miplay-bridge/internal/alsa"
+	"github.com/miplay-bridge/miplay-bridge/internal/alsa/alsatest"
 	"github.com/miplay-bridge/miplay-bridge/internal/config"
 	"github.com/miplay-bridge/miplay-bridge/internal/mpd"
 )
@@ -408,6 +409,56 @@ func TestSetMuteNeedsAnInitialisedMixer(t *testing.T) {
 	}
 	if _, ok := engine.Volume(); ok {
 		t.Fatal("an uninitialised mixer must report no switch state")
+	}
+}
+
+// TestVolumeLevelNeedsAnInitialisedMixer pins the protocol-volume gate: with
+// no hardware mixer backing it, VolumeLevel reports unavailable so the MiPlay
+// layer falls back to its own configured default.
+func TestVolumeLevelNeedsAnInitialisedMixer(t *testing.T) {
+	kernel := newFakeKernel(t)
+	engine := testEngine(t, kernel)
+	if level, ok := engine.VolumeLevel(); ok {
+		t.Fatalf("VolumeLevel = %d, %v; want unavailable without an initialised mixer", level, ok)
+	}
+}
+
+// TestVolumeFollowsTheHardwareControl pins the "volume = the hardware control"
+// contract end to end: reads report the control's live state after a refresh,
+// an out-of-band change (a host-side amixer invocation, the kernel's own mixer
+// writes) is picked up, and SetVolume writes the control even without a
+// playback kernel.
+func TestVolumeFollowsTheHardwareControl(t *testing.T) {
+	fake := alsatest.New()
+	cfg := config.Default()
+	logger := testLogger()
+	mixer := alsa.New(cfg, logger).WithRunner(fake.Run)
+	if _, err := mixer.Init(context.Background()); err != nil {
+		t.Fatalf("mixer init: %v", err)
+	}
+
+	// No playback kernel at all: the hardware mixer alone backs the engine.
+	engine := New(cfg, logger, nil, mixer)
+
+	// Init calibrated the effective control to the configured default volume.
+	level, ok := engine.VolumeLevel()
+	if !ok || level != cfg.DefaultVolume {
+		t.Fatalf("VolumeLevel = %d, %v; want the effective control at the init-calibrated %d", level, ok, cfg.DefaultVolume)
+	}
+
+	// An out-of-band change only becomes visible after a refresh.
+	fake.SetPercent("Headphone", 42)
+	engine.RefreshVolume(context.Background())
+	if level, ok = engine.VolumeLevel(); !ok || level != 42 {
+		t.Fatalf("VolumeLevel after refresh = %d, %v; want the control's 42", level, ok)
+	}
+
+	// Writes go to the hardware control even with no kernel to mirror into.
+	if applied, err := engine.SetVolume(context.Background(), 33); err != nil || applied != 33 {
+		t.Fatalf("SetVolume = %d, %v", applied, err)
+	}
+	if got := fake.PercentOf("Headphone"); got != 33 {
+		t.Fatalf("hardware control = %d, want 33", got)
 	}
 }
 

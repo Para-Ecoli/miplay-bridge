@@ -32,6 +32,12 @@ type Hooks struct {
 	Release func()
 	// SetVolume mirrors the phone's SET_VOLUME onto the hardware mixer.
 	SetVolume func(percent int)
+	// Volume reports the live hardware volume percentage; ok is false when no
+	// hardware mixer is available. A new control session starts from this
+	// level and GET_VOLUME answers it, so the phone follows the real mixer
+	// instead of the configured default. It is invoked while the session lock
+	// is held, so it must not call back into the receiver.
+	Volume func() (int, bool)
 }
 
 // SessionSummary is the post-mortem of the most recent control session, kept
@@ -202,6 +208,20 @@ func (r *Receiver) acceptLoop(ctx context.Context) {
 	}
 }
 
+// sessionVolume is the level a new control session starts from: the live
+// hardware volume when a mixer is wired, else the configured default.
+// Starting from the configured default made every reconnect - or second
+// control connection - report a level nobody set, which snapped the phone's
+// slider back after a console or phone volume change.
+func (r *Receiver) sessionVolume() int {
+	if r.hooks.Volume != nil {
+		if current, ok := r.hooks.Volume(); ok && current >= 0 && current <= 100 {
+			return current
+		}
+	}
+	return r.cfg.DefaultVolume
+}
+
 // handleControl runs one control connection end to end.
 func (r *Receiver) handleControl(ctx context.Context, connection net.Conn) {
 	peerHost, peerPort := endpointOf(connection.RemoteAddr())
@@ -215,13 +235,15 @@ func (r *Receiver) handleControl(ctx context.Context, connection net.Conn) {
 		connection.Close()
 		return
 	}
-	session, err := NewLegacyReceiverSession(challenge, 0, r.cfg.MiPlayName, r.cfg.DefaultVolume,
+	session, err := NewLegacyReceiverSession(challenge, 0, r.cfg.MiPlayName, r.sessionVolume(),
 		localHost, localPort, peerHost, peerPort)
 	if err != nil {
 		r.logger.Error("miplay cannot create the session", "error", err)
 		connection.Close()
 		return
 	}
+	// The provider keeps GET_VOLUME honest for the life of the connection.
+	session.SetVolumeProvider(r.hooks.Volume)
 	report.session = session
 	report.conn = connection
 
@@ -585,7 +607,7 @@ func (r *Receiver) Status() Status {
 		Advertising: r.responder.Advertising(),
 		ListenPort:  r.cfg.MiPlayControlPort,
 		DeviceID:    r.responder.Identity().canonicalUUID(),
-		Volume:      r.cfg.DefaultVolume,
+		Volume:      r.sessionVolume(),
 		State:       "idle",
 		Pipeline:    r.pipeline.Stats(),
 		LastSession: lastSession,
@@ -605,7 +627,11 @@ func (r *Receiver) Status() Status {
 	}
 	if report.session != nil {
 		status.SourceName = report.session.SourceName()
-		status.Volume = report.session.Volume()
+		if r.hooks.Volume == nil {
+			// Without a live mixer the session's own copy is the only
+			// source of truth available.
+			status.Volume = report.session.Volume()
+		}
 		status.Safety = report.session.SafetyDiagnostics()
 		status.MediaInfo = report.session.MediaInfo()
 		status.LastSession = nil

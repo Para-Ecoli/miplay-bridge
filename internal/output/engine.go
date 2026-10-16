@@ -74,6 +74,9 @@ type Player interface {
 	SetVolume(ctx context.Context, percent int) (int, error)
 	SetMute(ctx context.Context, muted bool) (bool, error)
 	Volume() (int, bool)
+	// RefreshVolume re-reads the hardware control so the next Volume read
+	// reports the control's live state instead of a stale snapshot.
+	RefreshVolume(ctx context.Context)
 }
 
 // Engine arbitrates the sound card between the MiPlay pipeline and the MPD
@@ -332,8 +335,23 @@ func (e *Engine) Volume() (int, bool) {
 	return state.VolumePercent, state.Muted
 }
 
-// RefreshMixer re-reads the hardware so status endpoints report the truth.
-func (e *Engine) RefreshMixer(ctx context.Context) {
+// VolumeLevel reports the cached hardware mixer percentage and whether an
+// initialised mixer backs it. The MiPlay protocol volume reads through this:
+// new control sessions start from this level and GET_VOLUME answers it, so
+// the phone's slider follows the real mixer instead of the configured
+// default. Callers refresh the mixer first when they need the control's live
+// state.
+func (e *Engine) VolumeLevel() (int, bool) {
+	if e.mixer == nil || !e.mixer.State().Initialized {
+		return 0, false
+	}
+	return e.mixer.State().VolumePercent, true
+}
+
+// RefreshVolume re-reads the hardware mixer so every read surface (the
+// console status poll, the MiPlay protocol, DLNA GetVolume) reports the
+// control's true state rather than a stale snapshot.
+func (e *Engine) RefreshVolume(ctx context.Context) {
 	if e.mixer == nil {
 		return
 	}
