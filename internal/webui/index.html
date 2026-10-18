@@ -504,6 +504,11 @@
   function mixIsExclusive(c) { return mixCap(c, "cswitch-exclusive"); }
   function mixGuarded(name) { return (mixGuards.get(name) || 0) > Date.now(); }
   function mixGuard(name) { mixGuards.set(name, Date.now() + MIX_GUARD_MS); }
+  // refs 以「控件名|流」与「控件名|source」两种键保存：同一个控件可以同时拥有
+  // 播放行（pvolume）和排他录音来源单选项（cswitch-exclusive），只用控件名
+  // 作键会让后建的单选项覆盖播放行，写响应与轮询就再也找不到播放滑条，
+  // 拖动时清空的 dB 文本也因此无法恢复。
+  function mixRefKey(name, stream) { return name + "|" + stream; }
 
   function mixEl(tag, cls, text) {
     var node = document.createElement(tag);
@@ -554,7 +559,7 @@
 
     var body = mixEl("div", "mixer-body");
     var ref = { row: row, slider: null, switchEl: null, stream: stream };
-    mixRefs.set(control.name, ref);
+    mixRefs.set(mixRefKey(control.name, stream), ref);
 
     var wantSwitch = stream === "playback" ? mixHasPbSwitch(control) : mixHasCapSwitch(control);
     if (wantSwitch) {
@@ -622,7 +627,7 @@
       mixGuard(control.name);
       mixSendSwitch(control.name, "capture", "on");
     });
-    mixRefs.set(control.name, { sourceItem: wrap, sourceInput: input, stream: "capture" });
+    mixRefs.set(mixRefKey(control.name, "source"), { sourceItem: wrap, sourceInput: input, stream: "capture" });
     return wrap;
   }
 
@@ -670,38 +675,45 @@
       (info.mixerName ? " · " + info.mixerName : "");
 
     (state.controls || []).forEach(function (control) {
-      var ref = mixRefs.get(control.name);
-      if (!ref) { return; }
       var isGuarded = mixGuarded(control.name);
-
-      // 单选项（排他录音来源）
-      if (ref.sourceInput) {
-        var captureValue = control.channels[0] && control.channels[0].capture;
-        var on = !!(captureValue && captureValue.hasSwitch && captureValue.on);
-        if (!(mode === "poll" && isGuarded)) { ref.sourceInput.checked = on; }
-        ref.sourceItem.classList.toggle("active", on);
-        return;
-      }
-
-      if (ref.switchEl) {
-        var switchValue = null;
-        control.channels.forEach(function (ch) {
-          if (!switchValue && ch[ref.stream] && ch[ref.stream].hasSwitch) { switchValue = ch[ref.stream]; }
-        });
-        if (switchValue && !(mode === "poll" && isGuarded)) {
-          ref.switchEl.checked = switchValue.on;
-        }
-      }
-
-      if (ref.slider) {
-        var infos = control.channels.map(function (ch) { return ch[ref.stream]; })
-          .filter(function (v) { return v && v.hasVolume; });
-        if (infos.length && !(mode === "poll" && isGuarded)) {
-          ref.slider.el.value = infos[0].raw;
-          mixSetUnifiedText(ref.slider, infos);
-        }
-      }
+      // 同一个控件的播放行、录音行与录音来源单选项互不覆盖，全部按快照更新。
+      mixApplyRow(control, "playback", mode, isGuarded);
+      mixApplyRow(control, "capture", mode, isGuarded);
+      mixApplySource(control, mode, isGuarded);
     });
+  }
+
+  function mixApplyRow(control, stream, mode, isGuarded) {
+    var ref = mixRefs.get(mixRefKey(control.name, stream));
+    if (!ref) { return; }
+
+    if (ref.switchEl) {
+      var switchValue = null;
+      control.channels.forEach(function (ch) {
+        if (!switchValue && ch[stream] && ch[stream].hasSwitch) { switchValue = ch[stream]; }
+      });
+      if (switchValue && !(mode === "poll" && isGuarded)) {
+        ref.switchEl.checked = switchValue.on;
+      }
+    }
+
+    if (ref.slider) {
+      var infos = control.channels.map(function (ch) { return ch[stream]; })
+        .filter(function (v) { return v && v.hasVolume; });
+      if (infos.length && !(mode === "poll" && isGuarded)) {
+        ref.slider.el.value = infos[0].raw;
+        mixSetUnifiedText(ref.slider, infos);
+      }
+    }
+  }
+
+  function mixApplySource(control, mode, isGuarded) {
+    var ref = mixRefs.get(mixRefKey(control.name, "source"));
+    if (!ref) { return; }
+    var captureValue = control.channels[0] && control.channels[0].capture;
+    var on = !!(captureValue && captureValue.hasSwitch && captureValue.on);
+    if (!(mode === "poll" && isGuarded)) { ref.sourceInput.checked = on; }
+    ref.sourceItem.classList.toggle("active", on);
   }
 
   // ------------------------------------------------------------ 混音器请求
