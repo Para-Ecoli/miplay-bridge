@@ -263,6 +263,45 @@ func pairsToMap(pairs []Pair) map[string]string {
 	return values
 }
 
+// SetVolume sets the playback kernel's software mixer level (0-100). The
+// kernel runs with mixer_type "software", so this scales decoded samples
+// inside MPD and never writes an ALSA control: the hardware mixer stays the
+// exclusive domain of the console.
+func (c *Client) SetVolume(ctx context.Context, percent int) error {
+	if percent < 0 {
+		percent = 0
+	}
+	if percent > 100 {
+		percent = 100
+	}
+	_, err := c.command(ctx, "setvol", strconv.Itoa(percent))
+	return err
+}
+
+// Volume reads the kernel's software mixer level. ok is false when the kernel
+// does not report one (for example a paused output).
+func (c *Client) Volume(ctx context.Context) (int, bool, error) {
+	status, err := c.Status(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	raw, ok := status["volume"]
+	if !ok {
+		return 0, false, nil
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, false, fmt.Errorf("mpd volume %q: %w", raw, err)
+	}
+	if value < 0 {
+		value = 0
+	}
+	if value > 100 {
+		value = 100
+	}
+	return value, true, nil
+}
+
 // Clear empties the queue.
 func (c *Client) Clear(ctx context.Context) error {
 	_, err := c.command(ctx, "clear")

@@ -15,15 +15,15 @@
 #     妙播控制口监听 8899/tcp。
 #
 # 声卡选择：宿主机执行 `cat /proc/asound/cards` 查看编号，通过 ALSA_CARD 指定。
-# 硬件混音器面板与协议音量均作用于该卡；协议音量默认自动探测绑定控件
-# （Headphone/Master/Speaker/PCM 等），可用 BRIDGE_VOLUME_CONTROL 显式指定。
+# 控制台「硬件混音器」面板是修改该卡 ALSA 音量的唯一入口；妙播与 DLNA 的
+# 协议音量只调整软件增益，不会改动硬件混音器。
 
 services:
   miplay-bridge:
     # 优先使用 GHCR 预构建镜像（`docker compose pull` 更新到最新正式版）；
     # 镜像不可用（尚未发布 / 离线）时自动回退为本地构建。
     # 生产环境建议固定精确版本，例如 ghcr.io/para-ecoli/miplay-bridge:0.1.0
-    # image: ghcr.io/para-ecoli/miplay-bridge:latest
+    # image: ghcr.1ms.run/para-ecoli/miplay-bridge:latest
     build:
       context: .            # 构建上下文为项目根目录（Dockerfile 所在处）
       dockerfile: Dockerfile
@@ -44,11 +44,9 @@ services:
       # 声卡编号与 PCM 设备号：宿主执行 `cat /proc/asound/cards` 确认后填写。
       ALSA_CARD: "0"
       ALSA_PCM_DEVICE: "0"
-      # 协议音量（妙播手机滑条 / DLNA RenderingControl）绑定的 ALSA 控件名；
-      # 留空 = 启动时自动探测并在日志打印绑定结果（面板仍可调控件全集）。
-      # BRIDGE_VOLUME_CONTROL: "Headphone"
-      # 未探测到可用音量控件时妙播会话的默认音量（0-100）。
-      # BRIDGE_VOLUME_DEFAULT: "80"
+      # 妙播协议软件增益的初始值（0-100），与硬件混音器无关。
+      # DLNA 内核增益默认 100，由控制端通过 RenderingControl 设置。
+      # BRIDGE_VOLUME_DEFAULT: "40"
       # amixer 二进制路径（容器内由 alsa-utils 提供，通常无需修改）。
       # AMIXER_PATH: "amixer"
       # 小米妙播功能开关及在手机端显示的设备名。

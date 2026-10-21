@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +22,7 @@ type fakeMPD struct {
 	commands []string
 	state    string
 	busy     bool
+	volume   int
 }
 
 func newFakeMPD(t *testing.T) *fakeMPD {
@@ -29,7 +31,7 @@ func newFakeMPD(t *testing.T) *fakeMPD {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := &fakeMPD{listener: listener, state: "stop"}
+	server := &fakeMPD{listener: listener, state: "stop", volume: 100}
 	go server.serve()
 	t.Cleanup(func() { listener.Close() })
 	return server
@@ -79,11 +81,17 @@ func (s *fakeMPD) handle(connection net.Conn) {
 			fmt.Fprint(connection, "OK\n")
 		case "status":
 			s.mu.Lock()
-			state := s.state
+			state, volume := s.state, s.volume
 			s.mu.Unlock()
-			fmt.Fprintf(connection, "repeat: 0\nrandom: 0\nsingle: 0\nconsume: 0\nstate: %s\nelapsed: 3.500\nduration: 210.000\nbitrate: 900\naudio: 44100:16:2\nOK\n", state)
+			fmt.Fprintf(connection, "repeat: 0\nrandom: 0\nsingle: 0\nconsume: 0\nstate: %s\nelapsed: 3.500\nduration: 210.000\nbitrate: 900\naudio: 44100:16:2\nvolume: %d\nOK\n", state, volume)
 		case "currentsong":
 			fmt.Fprint(connection, "file: http://127.0.0.1:8080/stream/1\nTitle: Test Track\nArtist: Test Artist\nAlbum: Test Album\nduration: 210.000\nOK\n")
+		case "setvol":
+			value, _ := strconv.Atoi(command[1])
+			s.mu.Lock()
+			s.volume = value
+			s.mu.Unlock()
+			fmt.Fprint(connection, "OK\n")
 		case "clear", "play", "pause", "stop", "next", "previous", "seekcur", "repeat", "random", "single", "consume", "add":
 			if command[0] == "play" {
 				s.mu.Lock()
@@ -162,6 +170,40 @@ func TestClientRoundTrip(t *testing.T) {
 	}
 	if err := client.SeekCur(ctx, 90*time.Second); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestClientSoftwareVolume(t *testing.T) {
+	server := newFakeMPD(t)
+	client := NewClient(server.addr(), 3*time.Second)
+	ctx := context.Background()
+
+	volume, ok, err := client.Volume(ctx)
+	if err != nil || !ok || volume != 100 {
+		t.Fatalf("initial Volume = %d/%v/%v, want 100/true", volume, ok, err)
+	}
+	if err := client.SetVolume(ctx, 42); err != nil {
+		t.Fatal(err)
+	}
+	volume, ok, err = client.Volume(ctx)
+	if err != nil || !ok || volume != 42 {
+		t.Fatalf("Volume after setvol = %d/%v/%v, want 42/true", volume, ok, err)
+	}
+	if err := client.SetVolume(ctx, 150); err != nil {
+		t.Fatal(err)
+	}
+	volume, _, err = client.Volume(ctx)
+	if err != nil || volume != 100 {
+		t.Fatalf("clamped Volume = %d/%v, want 100", volume, err)
+	}
+	found := false
+	for _, command := range server.recorded() {
+		if command == "setvol 42" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("commands = %v, want setvol 42", server.recorded())
 	}
 }
 

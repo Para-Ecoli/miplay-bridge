@@ -142,28 +142,20 @@ func run() error {
 	engine := output.New(cfg, logger, manager)
 	engine.Supervise(ctx)
 
-	// Step 3b: hardware mixer. The console panel may drive any control; the
-	// MiPlay and DLNA protocol volume paths drive the designated system
-	// control resolved once here. A card without a usable control degrades
-	// those two protocols to their fixed full-scale answers without ever
-	// blocking startup.
+	// Step 3b: hardware mixer. It belongs exclusively to the console: the
+	// MiPlay and DLNA protocol volume paths use their own software gain and
+	// never read or write an ALSA control. A card without a usable mixer
+	// degrades only the console panel, never the protocols.
 	mixer := mix.New(cfg, logger)
-	engine.SetSystemMixer(mixer)
-	if state, mixerErr := mixer.State(ctx); mixerErr != nil {
-		logger.Warn("hardware mixer state is unavailable; the console panel and the protocol volume degrade",
+	if _, mixerErr := mixer.State(ctx); mixerErr != nil {
+		logger.Warn("hardware mixer state is unavailable; the console mixer panel degrades",
 			"error", mixerErr, "amixer", cfg.AmixerPath)
-	} else if control := mix.ResolveSystemControl(state, cfg.VolumeControl); control != "" {
-		mixer.SetSystemControl(control)
-		logger.Info("protocol volume bound to the hardware mixer", "volume_control", control, "card", cfg.Card)
-	} else {
-		logger.Warn("no ALSA control carries a playback volume; the phone slider and DLNA volume stay at full scale",
-			"hint", "set BRIDGE_VOLUME_CONTROL to a control listed by `amixer scontrols`")
 	}
 
 	// Step 4: MiPlay receiver (mDNS + control channel + realtime pipeline).
 	var receiver *miplay.Receiver
 	if cfg.MiPlayEnabled {
-		receiver = miplay.NewReceiver(cfg, logger, miplayHooks(engine, logger))
+		receiver = miplay.NewReceiver(cfg, logger, miplayHooks(engine))
 		if err := receiver.Start(ctx); err != nil {
 			logger.Error("could not start the MiPlay receiver", "error", err)
 			_ = manager.Stop(context.Background())
@@ -253,13 +245,10 @@ func run() error {
 
 // miplayHooks connect the MiPlay receiver to the arbitration engine. The
 // engine is the single authority on who owns the sound card; the receiver
-// only ever asks. The volume hooks drive the hardware mixer through short
-// timeouts: they run inside the control-session loop, so they must never
-// stall the protocol.
-func miplayHooks(engine *output.Engine, logger *slog.Logger) miplay.Hooks {
-	volumeCtx := func() (context.Context, context.CancelFunc) {
-		return context.WithTimeout(context.Background(), 2*time.Second)
-	}
+// only ever asks. Volume is not wired here: MiPlay protocol volume is a
+// software gain inside the realtime pipeline, fully decoupled from the
+// hardware mixer.
+func miplayHooks(engine *output.Engine) miplay.Hooks {
 	return miplay.Hooks{
 		Claim: func() error {
 			if err := engine.Claim(output.SourceMiPlay); err != nil {
@@ -269,25 +258,6 @@ func miplayHooks(engine *output.Engine, logger *slog.Logger) miplay.Hooks {
 		},
 		Release: func() {
 			engine.Release(output.SourceMiPlay)
-		},
-		SetVolume: func(percent int) {
-			ctx, cancel := volumeCtx()
-			defer cancel()
-			if _, err := engine.SetVolume(ctx, percent); err != nil {
-				// The phone slider must never trigger a reconnect over a failed
-				// write; the session stays alive and the console can retry.
-				logger.Warn("could not mirror the miplay volume onto the hardware mixer",
-					"error", err, "volume", percent)
-			}
-		},
-		Volume: func() (int, bool) {
-			ctx, cancel := volumeCtx()
-			defer cancel()
-			percent, _, err := engine.Volume(ctx)
-			if err != nil {
-				return 0, false
-			}
-			return percent, true
 		},
 	}
 }

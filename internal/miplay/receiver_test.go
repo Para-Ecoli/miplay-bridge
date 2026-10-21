@@ -136,24 +136,21 @@ func TestControlHandshakeTimeoutGuardsUnauthenticatedConnections(t *testing.T) {
 	}
 }
 
-// TestControlVolumeCommandsDriveTheSession pins the receiver-level volume
-// contract: GET_VOLUME answers the live hardware level when a mixer is
-// wired, SET_VOLUME records the decoded level and mirrors it through the
-// hook, and neither command ever ends the control session.
-func TestControlVolumeCommandsDriveTheSession(t *testing.T) {
-	mirror := make(chan int, 4)
-	harness := newControlTestHarnessWithHooks(t, time.Second, Hooks{
-		SetVolume: func(percent int) { mirror <- percent },
-		Volume:    func() (int, bool) { return 51, true },
-	})
+// TestControlVolumeCommandsDriveTheSoftwareGain pins the receiver-level
+// volume contract: SET_VOLUME changes the pipeline's software gain (never an
+// ALSA control), GET_VOLUME answers that gain, and neither command ends the
+// control session.
+func TestControlVolumeCommandsDriveTheSoftwareGain(t *testing.T) {
+	harness := newControlTestHarness(t, time.Second)
 	harness.authenticate(t)
 
+	want := uint32(config.Default().VolumeDefault)
 	if _, err := harness.client.Write(EncodeCommand(CmdGetVolume, 3, nil)); err != nil {
 		t.Fatalf("write get volume: %v", err)
 	}
 	frame := readCommandFrame(t, harness.client)
-	if frame.Command != CmdGetVolumeAck || frame.Sequence != 3 || !bytes.Equal(frame.Payload, EncodeScalar(51)) {
-		t.Fatalf("reply = %+v, want the live hardware level 51", frame)
+	if frame.Command != CmdGetVolumeAck || frame.Sequence != 3 || !bytes.Equal(frame.Payload, EncodeScalar(want)) {
+		t.Fatalf("reply = %+v, want the initial gain %d", frame, want)
 	}
 
 	if _, err := harness.client.Write(EncodeCommand(CmdSetVolume, 5, EncodeScalar(64))); err != nil {
@@ -163,13 +160,15 @@ func TestControlVolumeCommandsDriveTheSession(t *testing.T) {
 	if frame.Command != CmdSetVolumeAck || frame.Sequence != 5 {
 		t.Fatalf("reply = %+v, want the set-volume acknowledgement", frame)
 	}
-	select {
-	case percent := <-mirror:
-		if percent != 64 {
-			t.Fatalf("mirrored volume = %d, want 64", percent)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("the set-volume hook was not invoked")
+	if got := harness.receiver.pipeline.currentGain(); got != 64 {
+		t.Fatalf("pipeline gain = %d, want the accepted 64", got)
+	}
+	if _, err := harness.client.Write(EncodeCommand(CmdGetVolume, 6, nil)); err != nil {
+		t.Fatalf("write second get volume: %v", err)
+	}
+	frame = readCommandFrame(t, harness.client)
+	if frame.Command != CmdGetVolumeAck || frame.Sequence != 6 || !bytes.Equal(frame.Payload, EncodeScalar(64)) {
+		t.Fatalf("reply = %+v, want the accepted gain 64", frame)
 	}
 }
 
@@ -190,22 +189,30 @@ func TestControlVolumeFallsBackToTheDefault(t *testing.T) {
 	}
 }
 
-// TestStatusReportsTheLiveVolume pins the status contract behind reconnects:
-// whenever a mixer hook is wired /api/status carries the live hardware level -
-// before the first session and while a session is active - so a second phone
-// or a reconnect never sees the level snap back to a stale copy.
-func TestStatusReportsTheLiveVolume(t *testing.T) {
-	harness := newControlTestHarnessWithHooks(t, time.Second, Hooks{
-		Volume: func() (int, bool) { return 51, true },
-	})
+// TestStatusReportsTheProtocolGain pins the status contract: /api/status
+// carries the receiver-wide software gain, not a hardware-mixer level and not
+// the copy captured by one connection.
+func TestStatusReportsTheProtocolGain(t *testing.T) {
+	harness := newControlTestHarness(t, time.Second)
+	harness.authenticate(t)
 
-	// Idle: no session yet, still the live level instead of the default.
-	if got := harness.receiver.Status().Volume; got != 51 {
-		t.Fatalf("idle status volume = %d, want the live level 51", got)
+	want := config.Default().VolumeDefault
+	if got := harness.receiver.Status().Volume; got != want {
+		t.Fatalf("idle status volume = %d, want the initial gain %d", got, want)
 	}
 
-	// An active session whose own copy (30) disagrees with the hardware (51):
-	// the session copy must never be the reported level.
+	if _, err := harness.client.Write(EncodeCommand(CmdSetVolume, 5, EncodeScalar(64))); err != nil {
+		t.Fatalf("write set volume: %v", err)
+	}
+	frame := readCommandFrame(t, harness.client)
+	if frame.Command != CmdSetVolumeAck {
+		t.Fatalf("reply = %+v, want the set-volume acknowledgement", frame)
+	}
+	if got := harness.receiver.Status().Volume; got != 64 {
+		t.Fatalf("status volume = %d, want the accepted gain 64", got)
+	}
+
+	// A session whose own copy disagrees must never override the shared gain.
 	session, err := NewLegacyReceiverSession([]byte(testChallenge), 0, "miplay test", 30,
 		testLocalHost, testLocalPort, testPeerHost, testPeerPort)
 	if err != nil {
@@ -216,13 +223,8 @@ func TestStatusReportsTheLiveVolume(t *testing.T) {
 		t.Fatal("cannot reserve the output slot for the synthetic session")
 	}
 	t.Cleanup(func() { harness.receiver.endSession(report) })
-
-	status := harness.receiver.Status()
-	if !status.Connected {
-		t.Fatal("synthetic session is not reported as connected")
-	}
-	if status.Volume != 51 {
-		t.Fatalf("connected status volume = %d, want the live level 51", status.Volume)
+	if got := harness.receiver.Status().Volume; got != 64 {
+		t.Fatalf("connected status volume = %d, want the shared gain 64", got)
 	}
 }
 

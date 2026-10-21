@@ -8,13 +8,13 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/miplay-bridge/miplay-bridge/internal/config"
-	"github.com/miplay-bridge/miplay-bridge/internal/mix"
 	"github.com/miplay-bridge/miplay-bridge/internal/mpd"
 )
 
@@ -27,6 +27,7 @@ type fakeKernel struct {
 	commands []string
 	state    string
 	busy     bool
+	volume   int
 }
 
 func newFakeKernel(t *testing.T) *fakeKernel {
@@ -35,7 +36,7 @@ func newFakeKernel(t *testing.T) *fakeKernel {
 	if err != nil {
 		t.Fatal(err)
 	}
-	kernel := &fakeKernel{listener: listener, state: "stop"}
+	kernel := &fakeKernel{listener: listener, state: "stop", volume: 100}
 	go kernel.serve()
 	t.Cleanup(func() { _ = listener.Close() })
 	return kernel
@@ -81,7 +82,10 @@ func (k *fakeKernel) handle(connection net.Conn) {
 		fields := strings.Fields(line)
 		switch fields[0] {
 		case "status":
-			fmt.Fprintf(connection, "state: %s\nelapsed: 3.500\nduration: 210.000\nOK\n", state)
+			k.mu.Lock()
+			volume := k.volume
+			k.mu.Unlock()
+			fmt.Fprintf(connection, "state: %s\nelapsed: 3.500\nduration: 210.000\nvolume: %d\nOK\n", state, volume)
 		case "currentsong":
 			fmt.Fprint(connection, "file: http://127.0.0.1:8080/stream/1\nTitle: Test Track\nArtist: Test Artist\nAlbum: Test Album\nduration: 210.000\nOK\n")
 		case "play":
@@ -97,6 +101,12 @@ func (k *fakeKernel) handle(connection net.Conn) {
 		case "stop":
 			k.setState("stop")
 			fmt.Fprint(connection, "OK\n")
+		case "setvol":
+			value, _ := strconv.Atoi(fields[1])
+			k.mu.Lock()
+			k.volume = value
+			k.mu.Unlock()
+			fmt.Fprint(connection, "OK\n")
 		case "clear", "add", "seekcur":
 			fmt.Fprint(connection, "OK\n")
 		default:
@@ -108,6 +118,12 @@ func (k *fakeKernel) handle(connection net.Conn) {
 func (k *fakeKernel) setState(state string) {
 	k.mu.Lock()
 	k.state = state
+	k.mu.Unlock()
+}
+
+func (k *fakeKernel) setVolume(volume int) {
+	k.mu.Lock()
+	k.volume = volume
 	k.mu.Unlock()
 }
 
@@ -388,57 +404,12 @@ func TestSuperviseReleasesStoppedKernel(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// hardware mixer surface
+// protocol volume: kernel software gain
 // ---------------------------------------------------------------------------
 
-// fakeSystemMixer is a scripted SystemMixer that mirrors the mix.Controller
-// contract on a 0-64 raw scale: it clamps the percentage and its reads
-// reflect the last write.
-type fakeSystemMixer struct {
-	percent int
-	muted   bool
-	err     error
-}
-
-func (m *fakeSystemMixer) SystemVolume(context.Context) (mix.SystemState, error) {
-	if m.err != nil {
-		return mix.SystemState{}, m.err
-	}
-	return mix.SystemState{
-		Control:   "Headphone",
-		Raw:       m.percent * 64 / 100,
-		Percent:   m.percent,
-		Muted:     m.muted,
-		HasVolume: true,
-		HasSwitch: true,
-	}, nil
-}
-
-func (m *fakeSystemMixer) SetSystemPercent(_ context.Context, percent int) (mix.SystemState, error) {
-	if m.err != nil {
-		return mix.SystemState{}, m.err
-	}
-	if percent < 0 {
-		percent = 0
-	}
-	if percent > 100 {
-		percent = 100
-	}
-	m.percent = percent
-	return m.SystemVolume(context.Background())
-}
-
-func (m *fakeSystemMixer) SetSystemMute(_ context.Context, muted bool) error {
-	if m.err != nil {
-		return m.err
-	}
-	m.muted = muted
-	return nil
-}
-
-func TestEngineVolumeWithoutAMixerDegrades(t *testing.T) {
-	// No kernel and no mixer: every volume surface reports the missing
-	// hardware control instead of crashing or needing MPD.
+func TestEngineVolumeWithoutKernelDegrades(t *testing.T) {
+	// No kernel: the software gain surface reports the missing playback
+	// kernel instead of touching any hardware mixer.
 	engine := New(config.Default(), testLogger(), nil)
 	ctx := context.Background()
 
@@ -453,16 +424,13 @@ func TestEngineVolumeWithoutAMixerDegrades(t *testing.T) {
 	}
 }
 
-func TestEngineVolumeDrivesTheSystemMixer(t *testing.T) {
-	// Deliberately no kernel: the volume path must never depend on MPD being
-	// reachable (mixer_type "null" keeps the kernel out of volume anyway).
-	engine := New(config.Default(), testLogger(), nil)
-	mixer := &fakeSystemMixer{percent: 42}
-	engine.SetSystemMixer(mixer)
+func TestEngineVolumeDrivesTheKernelSoftwareMixer(t *testing.T) {
+	kernel := newFakeKernel(t)
+	engine := testEngine(t, kernel)
 	ctx := context.Background()
 
-	if percent, muted, err := engine.Volume(ctx); err != nil || percent != 42 || muted {
-		t.Fatalf("Volume = %d/%v/%v, want 42/false", percent, muted, err)
+	if percent, muted, err := engine.Volume(ctx); err != nil || percent != 100 || muted {
+		t.Fatalf("initial Volume = %d/%v/%v, want 100/false", percent, muted, err)
 	}
 	if percent, err := engine.SetVolume(ctx, 33); err != nil || percent != 33 {
 		t.Fatalf("SetVolume(33) = %d, %v", percent, err)
@@ -473,24 +441,36 @@ func TestEngineVolumeDrivesTheSystemMixer(t *testing.T) {
 	if muted, err := engine.SetMute(ctx, true); err != nil || !muted {
 		t.Fatalf("SetMute(true) = %v, %v", muted, err)
 	}
-	if percent, muted, err := engine.Volume(ctx); err != nil || percent != 100 || !muted {
-		t.Fatalf("read-back = %d/%v/%v, want 100/true", percent, muted, err)
+	// A level set while muted is remembered but not written to the kernel.
+	if percent, err := engine.SetVolume(ctx, 40); err != nil || percent != 40 {
+		t.Fatalf("SetVolume(40) while muted = %d, %v", percent, err)
 	}
-}
+	if percent, muted, err := engine.Volume(ctx); err != nil || percent != 40 || !muted {
+		t.Fatalf("muted Volume = %d/%v/%v, want 40/true", percent, muted, err)
+	}
+	if muted, err := engine.SetMute(ctx, false); err != nil || muted {
+		t.Fatalf("SetMute(false) = %v, %v", muted, err)
+	}
 
-func TestEngineVolumePropagatesMixerFailures(t *testing.T) {
-	engine := New(config.Default(), testLogger(), nil)
-	mixer := &fakeSystemMixer{err: errors.New("amixer exploded")}
-	engine.SetSystemMixer(mixer)
-	ctx := context.Background()
+	// An external client changing the kernel's software gain is reflected.
+	kernel.setVolume(42)
+	if percent, muted, err := engine.Volume(ctx); err != nil || percent != 42 || muted {
+		t.Fatalf("live Volume = %d/%v/%v, want 42/false", percent, muted, err)
+	}
 
-	if _, err := engine.SetVolume(ctx, 50); err == nil || !strings.Contains(err.Error(), "amixer exploded") {
-		t.Fatalf("SetVolume = %v", err)
+	var setvol []string
+	for _, command := range kernel.recorded() {
+		if strings.HasPrefix(command, "setvol") {
+			setvol = append(setvol, command)
+		}
 	}
-	if _, err := engine.SetMute(ctx, false); err == nil || !strings.Contains(err.Error(), "amixer exploded") {
-		t.Fatalf("SetMute = %v", err)
+	want := []string{"setvol 33", "setvol 100", "setvol 0", "setvol 40"}
+	if len(setvol) != len(want) {
+		t.Fatalf("setvol commands = %v, want %v", setvol, want)
 	}
-	if _, _, err := engine.Volume(ctx); err == nil || !strings.Contains(err.Error(), "amixer exploded") {
-		t.Fatalf("Volume = %v", err)
+	for index := range want {
+		if setvol[index] != want[index] {
+			t.Fatalf("setvol commands = %v, want %v", setvol, want)
+		}
 	}
 }

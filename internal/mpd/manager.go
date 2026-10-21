@@ -425,7 +425,7 @@ audio_output {
     type            "alsa"
     name            "妙播桥"
     device          "{{.Device}}"
-    mixer_type      "null"
+    mixer_type      "software"
     auto_resample   "no"
 }
 `

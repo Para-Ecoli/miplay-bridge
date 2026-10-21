@@ -242,7 +242,7 @@
 
   <footer>
     本页每 2 秒轮询 <code>/api/status</code>；所有数据操作均以 <code>x-bridge-token</code> 头鉴权（在容器环境变量 <code>BRIDGE_TOKEN</code> 中设置，未设置则局域网内免鉴权）。
-    硬件混音器面板经 <code>amixer</code> 直接读写本机 ALSA 控件（原始值，统一控制左右声道）：妙播手机滑条与 DLNA 控制端的音量/静音作用于启动日志中绑定的同一系统音量控件，三方实时一致；播放内核保持满量程（mixer_type null），无串联衰减。
+    硬件混音器面板经 <code>amixer</code> 直接读写本机 ALSA 控件（原始值，统一控制左右声道），是宿主声卡音量的唯一控制入口。妙播手机滑条与 DLNA 控制端的音量/静音只调整各自的软件增益（妙播实时管线 / MPD <code>mixer_type software</code>），不会改动这里的硬件控件，两套音量互不覆盖。
     「清除妙播连接」结束手机投送并释放声卡；「清除 DLNA 连接」停止播放、清空队列并结束全部事件订阅；「测试声卡」经播放内核走生产同路径播放 440 Hz 测试音。
   </footer>
 </div>

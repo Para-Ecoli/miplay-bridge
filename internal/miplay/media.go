@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miplay-bridge/miplay-bridge/internal/config"
@@ -125,6 +126,9 @@ type PipelineStats struct {
 	LastError    string    `json:"last_error,omitempty"`
 	FFmpegAlive  bool      `json:"ffmpeg_alive"`
 	AplayAlive   bool      `json:"aplay_alive"`
+	// Gain is the software gain percentage currently applied between ffmpeg
+	// and aplay. It is independent of the ALSA hardware volume.
+	Gain int `json:"gain"`
 }
 
 // lineRing keeps the last log lines of a child process.
@@ -183,10 +187,12 @@ func (p *logPipe) Write(data []byte) (int, error) {
 
 // Pipeline is the realtime playback path of MiPlay audio:
 //
-//	media frames -> ffmpeg (MPEG-TS/AAC -> s16le) -> aplay (exclusive hw)
+//	media frames -> ffmpeg (MPEG-TS/AAC -> s16le) -> software gain -> aplay (exclusive hw)
 //
 // ffmpeg runs with low-latency input flags; aplay owns an ALSA buffer sized
-// by MIPLAY_ALSA_BUFFER_US, the primary latency knob.
+// by MIPLAY_ALSA_BUFFER_US, the primary latency knob. The gain stage lives in
+// this process so the protocol volume never touches an ALSA mixer control:
+// the hardware volume remains the console's exclusive domain.
 type Pipeline struct {
 	cfg    config.Config
 	logger *slog.Logger
@@ -196,21 +202,106 @@ type Pipeline struct {
 	aplay  *exec.Cmd
 	stdin  io.WriteCloser
 
+	// gain is the current software gain percentage (0-100), applied to every
+	// decoded PCM chunk. Atomic so a slider move takes effect on the next
+	// chunk without restarting ffmpeg or aplay.
+	gain atomic.Int32
+
 	stats    PipelineStats
 	ffmpegEP *lineRing
 	aplayEP  *lineRing
 }
 
-// NewPipeline creates the pipeline for the configured ALSA device.
+// NewPipeline creates the pipeline for the configured ALSA device. The gain
+// starts at BRIDGE_VOLUME_DEFAULT, the level reported to the phone before it
+// changes anything.
 func NewPipeline(cfg config.Config, logger *slog.Logger) *Pipeline {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Pipeline{
+	pipeline := &Pipeline{
 		cfg:      cfg,
 		logger:   logger,
 		ffmpegEP: newLineRing(30),
 		aplayEP:  newLineRing(30),
+	}
+	pipeline.gain.Store(int32(clampGain(cfg.VolumeDefault)))
+	return pipeline
+}
+
+// SetGain updates the software gain percentage. The next decoded chunk uses
+// it; no process restart and no ALSA control write.
+func (p *Pipeline) SetGain(percent int) {
+	percent = clampGain(percent)
+	p.gain.Store(int32(percent))
+	p.logger.Debug("miplay software gain updated", "gain", percent)
+}
+
+func (p *Pipeline) currentGain() int {
+	return int(p.gain.Load())
+}
+
+func clampGain(percent int) int {
+	if percent < 0 {
+		return 0
+	}
+	if percent > 100 {
+		return 100
+	}
+	return percent
+}
+
+// applyGainS16LE scales interleaved little-endian S16 samples in place. Gain
+// 100 is a byte-identical pass-through (bit-perfect at unity); lower values
+// attenuate each sample. The caller always passes a whole number of 4-byte
+// stereo frames.
+func applyGainS16LE(data []byte, percent int) {
+	if percent >= 100 || len(data) == 0 {
+		return
+	}
+	if percent < 0 {
+		percent = 0
+	}
+	scale := int32(percent)
+	for offset := 0; offset+1 < len(data); offset += 2 {
+		sample := int32(int16(binary.LittleEndian.Uint16(data[offset:])))
+		scaled := sample * scale / 100
+		binary.LittleEndian.PutUint16(data[offset:], uint16(int16(scaled)))
+	}
+}
+
+// pump copies ffmpeg's decoded PCM into aplay, applying the live gain. Reads
+// are whole frames apart from a possible trailing partial frame, which is
+// carried to the next chunk.
+func (p *Pipeline) pump(reader io.Reader, writer io.WriteCloser) {
+	defer writer.Close()
+	buffer := make([]byte, 32*1024)
+	var carry []byte
+	for {
+		read, err := reader.Read(buffer)
+		if read > 0 {
+			chunk := buffer[:read]
+			if len(carry) > 0 {
+				combined := make([]byte, 0, len(carry)+read)
+				combined = append(combined, carry...)
+				combined = append(combined, chunk...)
+				chunk = combined
+				carry = nil
+			}
+			whole := len(chunk) - len(chunk)%4
+			if whole < len(chunk) {
+				carry = append(carry, chunk[whole:]...)
+			}
+			if whole > 0 {
+				applyGainS16LE(chunk[:whole], p.currentGain())
+				if _, writeErr := writer.Write(chunk[:whole]); writeErr != nil {
+					return
+				}
+			}
+		}
+		if err != nil {
+			return
+		}
 	}
 }
 
@@ -253,7 +344,10 @@ func (p *Pipeline) Start() error {
 	if err != nil {
 		return fmt.Errorf("open ffmpeg stdout: %w", err)
 	}
-	aplay.Stdin = decoded
+	aplayInput, err := aplay.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("open aplay stdin: %w", err)
+	}
 	stdin, err := ffmpeg.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("open ffmpeg stdin: %w", err)
@@ -263,10 +357,12 @@ func (p *Pipeline) Start() error {
 		return fmt.Errorf("start %s on %s: %w (aplay log: %s)", p.cfg.AplayPath, p.cfg.ALSAHardwareDevice(), err, p.aplayEP.String())
 	}
 	if err := ffmpeg.Start(); err != nil {
+		_ = aplayInput.Close()
 		_ = aplay.Process.Kill()
 		_, _ = aplay.Process.Wait()
 		return fmt.Errorf("start %s: %w", p.cfg.FFmpegPath, err)
 	}
+	go p.pump(decoded, aplayInput)
 
 	p.aplay = aplay
 	p.ffmpeg = ffmpeg
@@ -275,6 +371,7 @@ func (p *Pipeline) Start() error {
 	p.logger.Info("miplay realtime pipeline started",
 		"device", p.cfg.ALSAHardwareDevice(),
 		"aplay_buffer_us", p.cfg.MiPlayAlsaBufferUS,
+		"software_gain", p.currentGain(),
 		"ffmpeg_pid", ffmpeg.Process.Pid,
 		"aplay_pid", aplay.Process.Pid,
 	)
@@ -364,6 +461,7 @@ func (p *Pipeline) Stats() PipelineStats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	stats := p.stats
+	stats.Gain = p.currentGain()
 	if p.ffmpeg != nil && p.ffmpeg.Process != nil && p.ffmpeg.ProcessState == nil {
 		stats.FFmpegAlive = true
 	}

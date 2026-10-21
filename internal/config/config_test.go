@@ -49,16 +49,13 @@ func TestDefaultCoversReceiverAndRenderer(t *testing.T) {
 	}
 }
 
-func TestDefaultCoversTheHardwareMixer(t *testing.T) {
+func TestDefaultCoversTheHardwareMixerAndProtocolGain(t *testing.T) {
 	cfg := Default()
 	if cfg.AmixerPath != "amixer" {
 		t.Fatalf("AmixerPath = %q, want the bare binary resolved through PATH", cfg.AmixerPath)
 	}
-	if cfg.VolumeControl != "" {
-		t.Fatalf("VolumeControl = %q, want auto-detection", cfg.VolumeControl)
-	}
 	if cfg.VolumeDefault != 80 {
-		t.Fatalf("VolumeDefault = %d, want 80", cfg.VolumeDefault)
+		t.Fatalf("VolumeDefault = %d, want the initial protocol gain 80", cfg.VolumeDefault)
 	}
 }
 
@@ -104,7 +101,6 @@ func TestLoadReadsEnvironment(t *testing.T) {
 
 func TestLoadReadsMixerEnvironment(t *testing.T) {
 	t.Setenv("AMIXER_PATH", " /opt/alsa/bin/amixer ")
-	t.Setenv("BRIDGE_VOLUME_CONTROL", " Headphone ")
 	t.Setenv("BRIDGE_VOLUME_DEFAULT", "65")
 
 	cfg, err := Load()
@@ -113,9 +109,6 @@ func TestLoadReadsMixerEnvironment(t *testing.T) {
 	}
 	if cfg.AmixerPath != "/opt/alsa/bin/amixer" {
 		t.Fatalf("AmixerPath = %q", cfg.AmixerPath)
-	}
-	if cfg.VolumeControl != "Headphone" {
-		t.Fatalf("VolumeControl = %q", cfg.VolumeControl)
 	}
 	if cfg.VolumeDefault != 65 {
 		t.Fatalf("VolumeDefault = %d", cfg.VolumeDefault)

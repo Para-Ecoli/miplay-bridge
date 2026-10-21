@@ -8,8 +8,8 @@
 #   · 基础镜像固定 Alpine 3.20；该版本的 mpd 0.23.15 实测包含 alsa 输出插件，
 #     并自带 flac/mp3/aac/ogg/opus/wavpack/DSD 解码器与 ffmpeg 兜底解码；
 #   · alsa-utils 提供 aplay 与 amixer —— aplay 是妙播实时管线（ffmpeg 解码后）
-#     的 ALSA 输出端；amixer 驱动控制台「硬件混音器」面板与协议音量（妙播手机
-#     滑条 / DLNA RenderingControl），直写同一 designated ALSA 控件；
+#     的 ALSA 输出端；amixer 只驱动控制台「硬件混音器」面板。妙播与 DLNA 的
+#     协议音量是软件增益（管线内缩放 / MPD software mixer），不写 ALSA 控件；
 #   · ffmpeg 用于把妙播的 MPEG-TS/AAC 实时流解码为 48kHz 立体声 PCM；
 #   · 容器内读不到 /proc/asound，所有自检必须走 /dev/snd + ALSA control API；
 #   · mDNS(5353/udp) 与 SSDP(1900/udp) 组播发现要求 host 网络模式，
@@ -37,7 +37,7 @@ LABEL org.opencontainers.image.title="MiPlay Bridge" \
       org.opencontainers.image.licenses="CC-BY-NC-SA-4.0 AND GPL-2.0-only"
 
 # mpd        : 播放内核（独立进程，GPL-2.0，不修改其代码）
-# alsa-utils : aplay（妙播实时输出端）与 amixer（硬件混音器面板 / 协议音量直写 ALSA 控件）
+# alsa-utils : aplay（妙播实时输出端）与 amixer（仅控制台硬件混音器面板使用）
 # ffmpeg     : 妙播实时流 MPEG-TS/AAC -> PCM 解码（独立进程，不修改其代码）
 RUN apk add --no-cache mpd alsa-utils ffmpeg ca-certificates tzdata \
     && mkdir -p /var/lib/mpd/playlists /music /data

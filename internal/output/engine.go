@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/miplay-bridge/miplay-bridge/internal/config"
-	"github.com/miplay-bridge/miplay-bridge/internal/mix"
 	"github.com/miplay-bridge/miplay-bridge/internal/mpd"
 )
 
@@ -39,19 +38,11 @@ const (
 // "transition not available" fault.
 var ErrSourceBusy = errors.New("the sound card is held by another source")
 
-// ErrNoVolumeControl is re-exported from the mixer package so the DLNA layer
-// can degrade to its fixed full-scale answers without importing it.
-var ErrNoVolumeControl = mix.ErrNoVolumeControl
-
-// SystemMixer is the hardware-mixer surface the protocol volume paths drive.
-// *mix.Controller satisfies it structurally; the engine never mirrors the
-// level onto MPD (mixer_type "null"), so the hardware control stays the one
-// volume authority.
-type SystemMixer interface {
-	SystemVolume(ctx context.Context) (mix.SystemState, error)
-	SetSystemPercent(ctx context.Context, percent int) (mix.SystemState, error)
-	SetSystemMute(ctx context.Context, muted bool) error
-}
+// ErrNoVolumeControl reports that the software volume surface is unavailable
+// because the playback kernel is not running. The DLNA layer degrades to its
+// fixed full-scale answers on this error. Protocol volume never depends on an
+// ALSA control: the hardware mixer belongs to the console.
+var ErrNoVolumeControl = mpd.ErrUnavailable
 
 // PlaybackInfo is the unified playback snapshot.
 type PlaybackInfo struct {
@@ -71,8 +62,8 @@ type PlaybackInfo struct {
 
 // Player is the playback surface the DLNA renderer drives. *Engine implements
 // it; declaring it here also keeps the renderer unit-testable with a fake.
-// The volume methods drive the hardware mixer and never depend on the
-// playback kernel being available.
+// The volume methods drive the playback kernel's software gain; they never
+// touch the ALSA mixer, which the console owns exclusively.
 type Player interface {
 	ClaimDLNA() error
 	ReleaseDLNA()
@@ -97,8 +88,12 @@ type Engine struct {
 	manager *mpd.Manager
 	client  *mpd.Client
 
-	mixMu sync.RWMutex
-	mixer SystemMixer
+	// volumeMu guards the playback kernel's software gain state. Protocol
+	// volume is an upstream gain only: the hardware mixer is never read or
+	// written here, so the console's ALSA controls stay independent.
+	volumeMu sync.Mutex
+	volume   int
+	muted    bool
 
 	mu     sync.Mutex
 	active Source
@@ -118,6 +113,7 @@ func New(cfg config.Config, logger *slog.Logger, manager *mpd.Manager) *Engine {
 		logger:  logger,
 		manager: manager,
 		active:  SourceIdle,
+		volume:  100,
 	}
 	if manager != nil {
 		engine.client = manager.Client()
@@ -133,62 +129,83 @@ func (e *Engine) Client() *mpd.Client { return e.client }
 func (e *Engine) Manager() *mpd.Manager { return e.manager }
 
 // ---------------------------------------------------------------------------
-// Hardware mixer surface
+// Protocol volume: software gain inside the playback kernel
 // ---------------------------------------------------------------------------
-
-// SetSystemMixer wires the hardware mixer the protocol volume paths drive.
-// Called once during startup; safe to read concurrently afterwards.
-func (e *Engine) SetSystemMixer(mixer SystemMixer) {
-	e.mixMu.Lock()
-	e.mixer = mixer
-	e.mixMu.Unlock()
-}
-
-func (e *Engine) systemMixer() SystemMixer {
-	e.mixMu.RLock()
-	defer e.mixMu.RUnlock()
-	return e.mixer
-}
-
-// SetVolume writes the hardware level and reports the value actually in
-// effect. The level is clamped to 0-100. MPD is deliberately not mirrored:
-// under mixer_type "null" nobody reads the kernel volume.
+// SetVolume sets the playback kernel's software gain and reports the level in
+// effect. The hardware mixer is deliberately untouched: protocol volume is an
+// upstream gain, while the console owns every ALSA control.
 func (e *Engine) SetVolume(ctx context.Context, percent int) (int, error) {
-	mixer := e.systemMixer()
-	if mixer == nil {
+	percent = clampPercent(percent)
+	if e.client == nil {
 		return 0, ErrNoVolumeControl
 	}
-	state, err := mixer.SetSystemPercent(ctx, percent)
-	if err != nil {
+	e.volumeMu.Lock()
+	defer e.volumeMu.Unlock()
+	if e.muted {
+		// Keep the requested level for the next unmute; the kernel stays at 0.
+		e.volume = percent
+		return percent, nil
+	}
+	if err := e.client.SetVolume(ctx, percent); err != nil {
 		return 0, err
 	}
-	return state.Percent, nil
+	e.volume = percent
+	return percent, nil
 }
 
-// SetMute drives the hardware switch and reports the state in effect.
+// SetMute applies a software mute by driving the kernel's gain to zero and
+// restores the previous level on unmute. No ALSA switch is involved.
 func (e *Engine) SetMute(ctx context.Context, muted bool) (bool, error) {
-	mixer := e.systemMixer()
-	if mixer == nil {
+	if e.client == nil {
 		return false, ErrNoVolumeControl
 	}
-	if err := mixer.SetSystemMute(ctx, muted); err != nil {
+	e.volumeMu.Lock()
+	defer e.volumeMu.Unlock()
+	if e.muted == muted {
+		return muted, nil
+	}
+	target := e.volume
+	if muted {
+		target = 0
+	}
+	if err := e.client.SetVolume(ctx, target); err != nil {
 		return false, err
 	}
+	e.muted = muted
 	return muted, nil
 }
 
-// Volume reads the live hardware level and mute state; nothing is cached so
-// a console change is visible to the next protocol read immediately.
+// Volume reports the kernel's software gain and mute state. While muted the
+// remembered level is returned (not the zero the kernel sees) so a controller
+// can display and restore it.
 func (e *Engine) Volume(ctx context.Context) (int, bool, error) {
-	mixer := e.systemMixer()
-	if mixer == nil {
+	if e.client == nil {
 		return 0, false, ErrNoVolumeControl
 	}
-	state, err := mixer.SystemVolume(ctx)
+	e.volumeMu.Lock()
+	defer e.volumeMu.Unlock()
+	if e.muted {
+		return e.volume, true, nil
+	}
+	live, ok, err := e.client.Volume(ctx)
 	if err != nil {
 		return 0, false, err
 	}
-	return state.Percent, state.Muted, nil
+	if !ok {
+		return e.volume, false, nil
+	}
+	e.volume = live
+	return live, false, nil
+}
+
+func clampPercent(percent int) int {
+	if percent < 0 {
+		return 0
+	}
+	if percent > 100 {
+		return 100
+	}
+	return percent
 }
 
 // ---------------------------------------------------------------------------

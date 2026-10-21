@@ -535,10 +535,9 @@ func (r *Renderer) handleRenderingControl(w http.ResponseWriter, request *http.R
 	defer cancel()
 	switch action {
 	case "GetVolume":
-		// Live read: a controller opening its volume UI must see the level
-		// the console or the phone set, never a stale snapshot. Without a
-		// bound control the answer stays full scale so the device profile
-		// does not degrade.
+		// The controller sees the playback kernel's software gain. The ALSA
+		// hardware mixer is independent; without a running kernel the answer
+		// stays full scale so the device profile does not degrade.
 		volume := 100
 		if current, _, err := r.player.Volume(ctx); err == nil {
 			volume = current
@@ -554,7 +553,7 @@ func (r *Renderer) handleRenderingControl(w http.ResponseWriter, request *http.R
 		}
 		if _, err := r.player.SetVolume(ctx, desired); err != nil {
 			if errors.Is(err, output.ErrNoVolumeControl) {
-				// No hardware control: acknowledged and ignored so the
+				// No running kernel: acknowledged and ignored so the
 				// controller panel stays usable.
 				writeSOAPResponse(w, renderingControlService, action, nil)
 				return
@@ -577,6 +576,8 @@ func (r *Renderer) handleRenderingControl(w http.ResponseWriter, request *http.R
 			{Name: "CurrentMute", Value: value},
 		})
 	case "SetMute":
+		// Mute is a software gain of zero inside the kernel; the hardware
+		// mixer switch is never touched by this path.
 		desired := strings.TrimSpace(args["DesiredMute"])
 		if desired != "0" && desired != "1" {
 			writeSOAPFault(w, errInvalidArgs)

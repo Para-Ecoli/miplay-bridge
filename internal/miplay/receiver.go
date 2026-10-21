@@ -23,19 +23,15 @@ var ErrDeviceBusy = errors.New("sound card is busy")
 // when the TCP connection was never closed.
 const controlIdleTimeout = 60 * time.Second
 
-// Hooks connect the receiver to the sound-card arbitration engine.
+// Hooks connect the receiver to the sound-card arbitration engine. Volume is
+// not part of this contract: MiPlay protocol volume is a software gain applied
+// inside the realtime pipeline and never touches the ALSA hardware mixer.
 type Hooks struct {
 	// Claim reserves the realtime output slot. Returning ErrDeviceBusy is
 	// surfaced to the phone as a failed cast attempt.
 	Claim func() error
 	// Release frees the realtime output slot. Must be idempotent.
 	Release func()
-	// SetVolume mirrors the phone's SET_VOLUME onto the hardware mixer. It is
-	// fire-and-forget: a failing write is logged but never ends the session.
-	SetVolume func(percent int)
-	// Volume reports the live hardware volume percentage; ok is false when no
-	// mixer is wired or the level cannot be read.
-	Volume func() (int, bool)
 }
 
 // SessionSummary is the post-mortem of the most recent control session, kept
@@ -85,6 +81,13 @@ type Receiver struct {
 	pipeline  *Pipeline
 	responder *Responder
 
+	// gainMu guards the receiver-wide protocol gain. MiPlay's SET_VOLUME
+	// changes this software gain (applied between ffmpeg and aplay); it never
+	// reads or writes an ALSA control, so the hardware mixer stays fully
+	// independent.
+	gainMu sync.Mutex
+	gain   int
+
 	mu          sync.Mutex
 	listener    net.Listener
 	active      *sessionRuntime
@@ -125,6 +128,7 @@ func NewReceiver(cfg config.Config, logger *slog.Logger, hooks Hooks) *Receiver 
 		cfg:      cfg,
 		logger:   logger,
 		hooks:    hooks,
+		gain:     clampGain(cfg.VolumeDefault),
 		pipeline: NewPipeline(cfg, logger),
 		responder: NewResponder(ResponderConfig{
 			FriendlyName: cfg.MiPlayName,
@@ -206,18 +210,31 @@ func (r *Receiver) acceptLoop(ctx context.Context) {
 	}
 }
 
-// sessionVolume is the level a new control session starts from: the live
-// hardware volume when a mixer is wired, else the configured default.
-// Starting from a fixed default made every reconnect - or second control
-// connection - report a level nobody set, which snapped the phone's slider
-// back after a console or phone volume change.
+// protocolGain reports the receiver-wide software gain used by MiPlay. It is
+// an upstream gain only; the ALSA hardware volume is never consulted.
+func (r *Receiver) protocolGain() (int, bool) {
+	r.gainMu.Lock()
+	defer r.gainMu.Unlock()
+	return r.gain, true
+}
+
+// applyGain records the phone's SET_VOLUME and applies it to the realtime
+// pipeline. No ALSA control is read or written, so the hardware mixer and the
+// protocol volume remain fully decoupled.
+func (r *Receiver) applyGain(percent int) {
+	percent = clampGain(percent)
+	r.gainMu.Lock()
+	r.gain = percent
+	r.gainMu.Unlock()
+	r.pipeline.SetGain(percent)
+}
+
+// sessionVolume is the gain a new control session starts from: the shared
+// receiver-wide level, so a reconnect or a second connection never reports a
+// value the user did not set.
 func (r *Receiver) sessionVolume() int {
-	if r.hooks.Volume != nil {
-		if current, ok := r.hooks.Volume(); ok && current >= 0 && current <= 100 {
-			return current
-		}
-	}
-	return r.cfg.VolumeDefault
+	gain, _ := r.protocolGain()
+	return gain
 }
 
 // handleControl runs one control connection end to end.
@@ -240,8 +257,9 @@ func (r *Receiver) handleControl(ctx context.Context, connection net.Conn) {
 		connection.Close()
 		return
 	}
-	// The provider keeps GET_VOLUME honest for the life of the connection.
-	session.SetVolumeProvider(r.hooks.Volume)
+	// GET_VOLUME answers the shared software gain, so every control connection
+	// sees the level the phone set.
+	session.SetVolumeProvider(r.protocolGain)
 	report.session = session
 	report.conn = connection
 
@@ -304,14 +322,9 @@ func (r *Receiver) handleControl(ctx context.Context, connection net.Conn) {
 				break
 			}
 			if result.VolumeSet {
-				// The protocol volume is authoritative for the current source:
-				// mirror it onto the hardware mixer. A failed write only warns; the
-				// session stays alive so the slider never triggers a reconnect loop.
-				if r.hooks.SetVolume != nil {
-					r.hooks.SetVolume(result.Volume)
-				} else {
-					r.logger.Debug("miplay volume change ignored: no hardware mixer is wired", "volume", result.Volume)
-				}
+				// The protocol volume is a software gain inside the realtime
+				// pipeline; the ALSA hardware mixer is deliberately untouched.
+				r.applyGain(result.Volume)
 			}
 			if result.PauseRequested {
 				// A source-side pause is only a state hint: the reference
@@ -628,11 +641,6 @@ func (r *Receiver) Status() Status {
 	}
 	if report.session != nil {
 		status.SourceName = report.session.SourceName()
-		if r.hooks.Volume == nil {
-			// Without a live mixer the session's own copy is the only source
-			// of truth available.
-			status.Volume = report.session.Volume()
-		}
 		status.Safety = report.session.SafetyDiagnostics()
 		status.MediaInfo = report.session.MediaInfo()
 		status.LastSession = nil

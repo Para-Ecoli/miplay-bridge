@@ -29,7 +29,7 @@ func TestRenderConfigUsesVerifiedAudioOutput(t *testing.T) {
 port "{{.Port}}"
 audio_output {
     device "{{.Device}}"
-    mixer_type "null"
+    mixer_type "software"
 }
 `
 	if err := os.WriteFile(cfg.MPDTemplatePath, []byte(template), 0o600); err != nil {
@@ -43,7 +43,7 @@ audio_output {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, expected := range []string{`device "hw:0,0"`, `mixer_type "null"`} {
+	for _, expected := range []string{`device "hw:0,0"`, `mixer_type "software"`} {
 		if !strings.Contains(rendered, expected) {
 			t.Fatalf("rendered config missing %q:\n%s", expected, rendered)
 		}
@@ -65,6 +65,9 @@ func TestLoadTemplateUsesBuiltInFallback(t *testing.T) {
 	}
 	if !strings.Contains(rendered, `auto_resample   "no"`) {
 		t.Fatalf("fallback template must keep bit-perfect output:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, `mixer_type`) || !strings.Contains(rendered, `"software"`) {
+		t.Fatalf("fallback template must drive the kernel software mixer:\n%s", rendered)
 	}
 }
 

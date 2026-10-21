@@ -4,10 +4,9 @@
 // It is the in-process successor of the former standalone webmixer tool: the
 // same scontents/info/sset model, the same parsing rules and the same
 // raw-value write path (amixer -R sset), exposed as an injectable controller.
-// The HTTP console, the MiPlay protocol and the DLNA renderer all drive one
-// designated hardware control while MPD keeps mixer_type "null": the kernel
-// never participates in volume, which structurally rules out the historical
-// "two controls in series" attenuation bug.
+// This package belongs exclusively to the operator console. MiPlay and DLNA
+// protocol volume are software gains handled elsewhere; they never read or
+// write an ALSA control, so the hardware mixer stays independent.
 package mix
 
 import (

@@ -143,3 +143,55 @@ func TestPipelineLifecycleWithoutBinaries(t *testing.T) {
 		t.Fatalf("stats = %+v", stats)
 	}
 }
+
+func TestApplyGainS16LE(t *testing.T) {
+	samples := []int16{1000, -1000, 32767, -32768}
+	input := make([]byte, len(samples)*2)
+	for index, sample := range samples {
+		binary.LittleEndian.PutUint16(input[index*2:], uint16(sample))
+	}
+
+	// Unity gain is a byte-identical pass-through (bit-perfect at 100%).
+	unity := append([]byte(nil), input...)
+	applyGainS16LE(unity, 100)
+	if !bytes.Equal(unity, input) {
+		t.Fatalf("unity gain changed the PCM: % x -> % x", input, unity)
+	}
+
+	half := append([]byte(nil), input...)
+	applyGainS16LE(half, 50)
+	want := []int16{500, -500, 16383, -16384}
+	for index, expected := range want {
+		got := int16(binary.LittleEndian.Uint16(half[index*2:]))
+		if got != expected {
+			t.Fatalf("sample %d at 50%% = %d, want %d", index, got, expected)
+		}
+	}
+
+	silent := append([]byte(nil), input...)
+	applyGainS16LE(silent, 0)
+	if !bytes.Equal(silent, make([]byte, len(input))) {
+		t.Fatalf("0%% gain must silence the stream: % x", silent)
+	}
+}
+
+func TestPipelineGainIsLiveAndClamped(t *testing.T) {
+	cfg := config.Default()
+	cfg.VolumeDefault = 80
+	pipeline := NewPipeline(cfg, discardLogger())
+	if got := pipeline.Stats().Gain; got != 80 {
+		t.Fatalf("initial gain = %d, want 80", got)
+	}
+	pipeline.SetGain(35)
+	if got := pipeline.currentGain(); got != 35 {
+		t.Fatalf("gain = %d, want 35", got)
+	}
+	pipeline.SetGain(150)
+	if got := pipeline.currentGain(); got != 100 {
+		t.Fatalf("clamped gain = %d, want 100", got)
+	}
+	pipeline.SetGain(-5)
+	if got := pipeline.currentGain(); got != 0 {
+		t.Fatalf("clamped gain = %d, want 0", got)
+	}
+}

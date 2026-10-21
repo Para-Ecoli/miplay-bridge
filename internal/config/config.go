@@ -43,12 +43,9 @@ type Config struct {
 	// AmixerPath is the amixer binary of the hardware mixer console. It ships
 	// with alsa-utils inside the container (which also provides aplay).
 	AmixerPath string
-	// VolumeControl pins the ALSA control the MiPlay and DLNA protocol volume
-	// paths drive. Empty auto-detects the well-known playback control; the
-	// console panel is not affected and still regulates every control.
-	VolumeControl string
-	// VolumeDefault is the fallback level (0-100) a MiPlay control session
-	// starts from when the hardware mixer cannot be read.
+	// VolumeDefault is the initial MiPlay software gain (0-100). Protocol
+	// volume is an upstream gain applied inside the realtime pipeline; it is
+	// independent of the ALSA hardware mixer, which the console owns.
 	VolumeDefault int
 
 	// MPDBinary / MPDConfPath / MPDTemplatePath drive the playback kernel.
@@ -187,7 +184,6 @@ func Load() (Config, error) {
 	if v := strings.TrimSpace(os.Getenv("AMIXER_PATH")); v != "" {
 		cfg.AmixerPath = v
 	}
-	cfg.VolumeControl = strings.TrimSpace(os.Getenv("BRIDGE_VOLUME_CONTROL"))
 	if err := parseIntEnv("BRIDGE_VOLUME_DEFAULT", &cfg.VolumeDefault, 0, 100); err != nil {
 		return cfg, err
 	}
