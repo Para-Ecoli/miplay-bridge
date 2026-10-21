@@ -16,13 +16,6 @@ import (
 // card, mirroring the 409 device_busy semantics of the REST API.
 var ErrDeviceBusy = errors.New("sound card is busy")
 
-// controlIdleTimeout bounds how long an authenticated control session may go
-// completely silent before it is reaped. Phones heartbeat every few seconds
-// for the whole life of a session, including while the user browses the 妙播
-// panel without casting, so a minute of silence means the peer is gone even
-// when the TCP connection was never closed.
-const controlIdleTimeout = 60 * time.Second
-
 // Hooks connect the receiver to the sound-card arbitration engine. Volume is
 // not part of this contract: MiPlay protocol volume is a software gain applied
 // inside the realtime pipeline and never touches the ALSA hardware mixer.
@@ -47,8 +40,18 @@ type SessionSummary struct {
 	WFDUnstable   int                `json:"wfd_stability_events"`
 	MediaFrames   int64              `json:"media_frames"`
 	MediaBytes    int64              `json:"media_bytes"`
-	Error         string             `json:"error,omitempty"`
-	Trace         []TraceEntry       `json:"trace,omitempty"`
+	// MediaGaps counts stalls in media delivery (the source stopped sending or
+	// the network held packets back) long enough to exhaust the jitter cushion.
+	// Underruns in pipeline stats should closely track this number.
+	MediaGaps       int   `json:"media_gaps,omitempty"`
+	MediaGapMaxMS   int64 `json:"max_media_gap_ms,omitempty"`
+	MediaGapTotalMS int64 `json:"media_gap_total_ms,omitempty"`
+	// WriteBlocks counts times the receiver itself stalled feeding ffmpeg,
+	// which is receiver-side backpressure rather than a silent source.
+	WriteBlocks     int          `json:"media_write_blocks,omitempty"`
+	WriteBlockMaxMS int64        `json:"max_media_write_block_ms,omitempty"`
+	Error           string       `json:"error,omitempty"`
+	Trace           []TraceEntry `json:"trace,omitempty"`
 }
 
 // Status is the MiPlay slice of /api/status.
@@ -91,6 +94,7 @@ type Receiver struct {
 	mu          sync.Mutex
 	listener    net.Listener
 	active      *sessionRuntime
+	sessions    map[*sessionRuntime]struct{}
 	lastSession *SessionSummary
 	startedAt   time.Time
 	closed      bool
@@ -108,14 +112,25 @@ type sessionRuntime struct {
 	conn      net.Conn
 	claimed   bool
 
-	cancelWFD context.CancelFunc
-	paused    bool
+	// cancelSession cancels everything owned by this control connection
+	// (including a live WFD leg). cancelWFD is the per-Open child context so
+	// a repeated Open can restart just the media leg.
+	cancelSession context.CancelFunc
+	cancelWFD     context.CancelFunc
+	wfdGeneration uint64
+	paused        bool
 
+	lastActivity  time.Time
 	controlFrames int
 	rtspReady     bool
 	wfdEvents     int
 	mediaFrames   int64
 	mediaBytes    int64
+	mediaGaps     int
+	mediaGapMaxMS int64
+	mediaGapTotal int64
+	writeBlocks   int
+	writeBlockMax int64
 	lastError     string
 }
 
@@ -129,6 +144,7 @@ func NewReceiver(cfg config.Config, logger *slog.Logger, hooks Hooks) *Receiver 
 		logger:   logger,
 		hooks:    hooks,
 		gain:     clampGain(cfg.VolumeDefault),
+		sessions: make(map[*sessionRuntime]struct{}),
 		pipeline: NewPipeline(cfg, logger),
 		responder: NewResponder(ResponderConfig{
 			FriendlyName: cfg.MiPlayName,
@@ -237,11 +253,25 @@ func (r *Receiver) sessionVolume() int {
 	return gain
 }
 
-// handleControl runs one control connection end to end.
+// handleControl runs one control connection end to end. Its lifecycle mirrors
+// the reference receiver: a bounded handshake before OPEN, a single claimed
+// sender, a per-session idle watchdog that counts both control frames and
+// media packets, and a repeated OPEN that restarts only the WFD leg.
 func (r *Receiver) handleControl(ctx context.Context, connection net.Conn) {
 	peerHost, peerPort := endpointOf(connection.RemoteAddr())
 	localHost, localPort := endpointOf(connection.LocalAddr())
-	report := &sessionRuntime{peer: peerHost, startedAt: time.Now().UTC()}
+	report := &sessionRuntime{peer: peerHost, startedAt: time.Now().UTC(), lastActivity: time.Now()}
+	r.mu.Lock()
+	if r.sessions == nil {
+		r.sessions = make(map[*sessionRuntime]struct{})
+	}
+	r.sessions[report] = struct{}{}
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		delete(r.sessions, report)
+		r.mu.Unlock()
+	}()
 	r.logger.Info("miplay control connection accepted", "peer", peerHost, "local_port", localPort)
 
 	challenge, err := GenerateLegacyChallenge()
@@ -257,15 +287,16 @@ func (r *Receiver) handleControl(ctx context.Context, connection net.Conn) {
 		connection.Close()
 		return
 	}
-	// GET_VOLUME answers the shared software gain, so every control connection
-	// sees the level the phone set.
+	// GET_VOLUME answers the receiver-wide gain, so a poll on a connection that
+	// never carried SET_VOLUME still reports the newest level instead of the
+	// snapshot taken when the connection was established.
 	session.SetVolumeProvider(r.protocolGain)
 	report.session = session
 	report.conn = connection
 
-	var sessionCtx context.Context
-	sessionCtx, report.cancelWFD = context.WithCancel(ctx)
-	defer report.cancelWFD()
+	sessionCtx, cancelSession := context.WithCancel(ctx)
+	report.cancelSession = cancelSession
+	defer cancelSession()
 	defer connection.Close()
 
 	writer := &controlWriter{conn: connection}
@@ -274,26 +305,31 @@ func (r *Receiver) handleControl(ctx context.Context, connection net.Conn) {
 		return
 	}
 
-	// The fixed deadline guards only the unauthenticated window, matching the
-	// MIPLAY_HANDSHAKE_TIMEOUT_SECONDS contract. Once the legacy challenge is
-	// answered the phone owns the session: it heartbeats for minutes while the
-	// user pre-loads playback, so the deadline becomes an idle guard that every
-	// inbound frame refreshes instead of a hard cut-off.
+	// The fixed deadline guards the window before the source hands over its
+	// reverse-WFD endpoint. Once OPEN is accepted the session is governed by
+	// the idle watchdog below, which both control frames and media packets
+	// refresh.
 	handshakeDeadline := time.Now().Add(r.cfg.MiPlayHandshakeTimeout)
+	watchdogCtx, stopWatchdog := context.WithCancel(sessionCtx)
+	defer stopWatchdog()
+	go r.watchSessionIdle(watchdogCtx, report)
+
 	decoder := NewFrameDecoder()
 	buffer := make([]byte, 16*1024)
 
 	for {
-		if session.Authenticated() {
-			_ = connection.SetReadDeadline(time.Now().Add(controlIdleTimeout))
+		if session.Phase() == PhaseOpened {
+			_ = connection.SetReadDeadline(time.Time{})
 		} else {
 			_ = connection.SetReadDeadline(handshakeDeadline)
 		}
 		length, readErr := connection.Read(buffer)
 		if readErr != nil {
 			if isTimeout(readErr) {
-				if session.Authenticated() {
-					report.setError("control idle timeout")
+				if session.Phase() == PhaseOpened {
+					// A read deadline is never armed once the session is
+					// opened; treat a timeout defensively as idle.
+					report.setError("session idle timeout")
 				} else {
 					report.setError("handshake timed out")
 				}
@@ -302,6 +338,7 @@ func (r *Receiver) handleControl(ctx context.Context, connection net.Conn) {
 			}
 			break
 		}
+		report.touch()
 		frames, feedErr := decoder.Feed(buffer[:length])
 		if feedErr != nil {
 			report.setError(feedErr.Error())
@@ -347,10 +384,20 @@ func (r *Receiver) handleControl(ctx context.Context, connection net.Conn) {
 					stop = true
 					break
 				}
-				go func(request OpenDeviceRequest) {
-					if wfdErr := r.runWFD(sessionCtx, request, session, writer, report); wfdErr != nil && sessionCtx.Err() == nil {
-						r.logger.Warn("miplay WFD session ended", "error", wfdErr, "peer", peerHost)
-						report.setError(wfdErr.Error())
+				// A repeated OPEN within the same control session is valid in
+				// the captured transcripts: cancel the previous WFD leg and
+				// start a fresh one without re-claiming the output slot.
+				wfdCtx, generation := report.beginWFD(sessionCtx)
+				go func(request OpenDeviceRequest, wfdCtx context.Context, generation uint64) {
+					wfdErr := r.runWFD(wfdCtx, request, session, writer, report)
+					if !report.isCurrentWFD(generation) {
+						return // superseded by a newer OPEN
+					}
+					if wfdErr != nil {
+						if wfdCtx.Err() == nil {
+							r.logger.Warn("miplay WFD session ended", "error", wfdErr, "peer", peerHost)
+							report.setError(wfdErr.Error())
+						}
 					}
 					// A dead WFD leg ends the whole control session: the
 					// phone is gone, whatever the control socket thinks.
@@ -358,7 +405,7 @@ func (r *Receiver) handleControl(ctx context.Context, connection net.Conn) {
 					// deterministically; a read-deadline poke could be
 					// overwritten by the loop's own idle-deadline refresh.
 					_ = connection.Close()
-				}(*result.OpenRequest)
+				}(*result.OpenRequest, wfdCtx, generation)
 			}
 		}
 		if stop {
@@ -382,12 +429,18 @@ func (r *Receiver) handleControl(ctx context.Context, connection net.Conn) {
 	)
 }
 
-// beginSession reserves the exclusive output slot for one sender.
+// beginSession reserves the exclusive output slot for one sender. A repeated
+// OPEN from the sender that already owns the slot is accepted without a second
+// Claim: only the WFD leg restarts.
 func (r *Receiver) beginSession(report *sessionRuntime) bool {
 	r.mu.Lock()
-	if r.active != nil {
+	if r.active != nil && r.active != report {
 		r.mu.Unlock()
 		return false
+	}
+	if r.active == report {
+		r.mu.Unlock()
+		return true
 	}
 	r.active = report
 	r.mu.Unlock()
@@ -395,33 +448,82 @@ func (r *Receiver) beginSession(report *sessionRuntime) bool {
 	if r.hooks.Claim != nil {
 		if err := r.hooks.Claim(); err != nil {
 			r.mu.Lock()
-			r.active = nil
+			if r.active == report {
+				r.active = nil
+			}
 			r.mu.Unlock()
 			r.logger.Warn("miplay cast rejected: the sound card is owned by another source", "error", err)
 			return false
 		}
 	}
-	r.mu.Lock()
+	report.mu.Lock()
 	report.claimed = true
-	r.mu.Unlock()
+	report.mu.Unlock()
 	return true
 }
 
-// endSession tears down all session resources and frees the output slot.
+// endSession tears down all session resources and frees the output slot. An
+// unclaimed probe connection must never stop the pipeline of the live cast.
 func (r *Receiver) endSession(report *sessionRuntime) {
-	r.pipeline.Stop()
-	if report.cancelWFD != nil {
-		report.cancelWFD()
+	report.mu.Lock()
+	cancelWFD := report.cancelWFD
+	report.cancelWFD = nil
+	report.mu.Unlock()
+	if cancelWFD != nil {
+		cancelWFD()
 	}
+
 	r.mu.Lock()
 	if r.active == report {
 		r.active = nil
 	}
+	r.mu.Unlock()
+
+	report.mu.Lock()
 	claimed := report.claimed
 	report.claimed = false
-	r.mu.Unlock()
-	if claimed && r.hooks.Release != nil {
+	report.mu.Unlock()
+	if !claimed {
+		return
+	}
+	r.pipeline.Stop()
+	if r.hooks.Release != nil {
 		r.hooks.Release()
+	}
+}
+
+// watchSessionIdle closes a session that has gone completely silent. Control
+// frames and media packets both refresh lastActivity, so a phone that pauses
+// its stream but keeps heartbeating is not reaped, while a vanished phone
+// (no FIN, no heartbeats, no media) is.
+func (r *Receiver) watchSessionIdle(ctx context.Context, report *sessionRuntime) {
+	timeout := r.cfg.MiPlaySessionIdleTimeout
+	if timeout <= 0 {
+		return
+	}
+	interval := timeout / 3
+	if interval < time.Second {
+		interval = time.Second
+	}
+	if interval > 15*time.Second {
+		interval = 15 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if time.Since(report.lastActivityAt()) < timeout {
+				continue
+			}
+			report.setError("session idle timeout")
+			if connection := report.connection(); connection != nil {
+				_ = connection.Close()
+			}
+			return
+		}
 	}
 }
 
@@ -445,6 +547,22 @@ func (r *Receiver) runWFD(ctx context.Context, request OpenDeviceRequest, sessio
 		}
 		connections = append(connections, connection)
 	}
+	// Cancellation must abort the sockets, not merely set a flag: both the
+	// RTSP and media readers block in Read, and the phone may never close its
+	// side. The reference implementation aborts the transports on teardown.
+	stopWatcher := make(chan struct{})
+	defer close(stopWatcher)
+	go func() {
+		select {
+		case <-ctx.Done():
+			for _, connection := range connections {
+				_ = connection.SetReadDeadline(time.Now())
+				_ = connection.Close()
+			}
+		case <-stopWatcher:
+		}
+	}()
+
 	rtspConnection := connections[0]
 	auxConnection := connections[1]
 	mediaConnection := connections[2]
@@ -483,12 +601,27 @@ func (r *Receiver) runWFD(ctx context.Context, request OpenDeviceRequest, sessio
 	mediaDecoder := NewMediaFrameDecoder()
 	mediaBuffer := make([]byte, 32*1024)
 	firstPayload := true
+	// A read that waits at least this long means the source (or Wi-Fi) stopped
+	// delivering. The ALSA cushion is sized in the same range, so these gaps
+	// are what aplay reports as underruns.
+	const mediaGapWarn = time.Second
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
 		_ = mediaConnection.SetReadDeadline(time.Now().Add(30 * time.Second))
+		readStarted := time.Now()
 		length, err := mediaConnection.Read(mediaBuffer)
+		readWaited := time.Since(readStarted)
+		if readWaited >= mediaGapWarn && (length > 0 || isTimeout(err)) {
+			report.recordMediaGap(readWaited)
+			r.logger.Warn("miplay media delivery stalled",
+				"source", target,
+				"gap_ms", readWaited.Milliseconds(),
+				"source_paused", report.isPaused(),
+				"received_bytes", length,
+			)
+		}
 		if err != nil {
 			if isTimeout(err) {
 				continue
@@ -498,6 +631,7 @@ func (r *Receiver) runWFD(ctx context.Context, request OpenDeviceRequest, sessio
 			}
 			return fmt.Errorf("media read: %w", err)
 		}
+		report.touch()
 		frames, err := mediaDecoder.Feed(mediaBuffer[:length])
 		if err != nil {
 			return fmt.Errorf("media framing: %w", err)
@@ -512,7 +646,16 @@ func (r *Receiver) runWFD(ctx context.Context, request OpenDeviceRequest, sessio
 					return startErr
 				}
 			}
-			if writeErr := r.pipeline.Write(packet.TransportStream); writeErr != nil {
+			writeStarted := time.Now()
+			writeErr := r.pipeline.Write(packet.TransportStream)
+			if blocked := time.Since(writeStarted); blocked >= mediaGapWarn {
+				report.recordWriteBlock(blocked)
+				r.logger.Warn("miplay media write blocked",
+					"source", target,
+					"blocked_ms", blocked.Milliseconds(),
+				)
+			}
+			if writeErr != nil {
 				return writeErr
 			}
 			report.addMedia(int64(len(packet.TransportStream)))
@@ -578,35 +721,51 @@ func (r *Receiver) runRTSPControl(ctx context.Context, connection net.Conn, sour
 	}
 }
 
-// Disconnect tears down the active cast. It is idempotent and safe to call
+// Disconnect clears every MiPlay control connection, not just the claimed
+// sender. Handshake probes and an active WFD leg are both cancelled, but the
+// listener, mDNS registration, gain and hardware mixer stay untouched so the
+// next sender can connect immediately. It is idempotent and safe to call
 // concurrently.
 func (r *Receiver) Disconnect() (bool, error) {
 	r.mu.Lock()
-	report := r.active
+	wasConnected := r.active != nil
+	reports := make([]*sessionRuntime, 0, len(r.sessions))
+	for report := range r.sessions {
+		reports = append(reports, report)
+	}
 	r.mu.Unlock()
-	if report == nil {
+
+	if len(reports) == 0 {
 		return false, nil
 	}
-	r.logger.Info("miplay disconnect requested", "peer", report.peer)
-	if report.conn != nil {
-		_ = report.conn.SetReadDeadline(time.Now())
-		_ = report.conn.Close()
+	for _, report := range reports {
+		report.mu.Lock()
+		connection := report.conn
+		cancel := report.cancelSession
+		report.mu.Unlock()
+		r.logger.Info("miplay disconnect requested", "peer", report.peer)
+		if connection != nil {
+			_ = connection.SetReadDeadline(time.Now())
+			_ = connection.Close()
+		}
+		if cancel != nil {
+			cancel()
+		}
 	}
-	if report.cancelWFD != nil {
-		report.cancelWFD()
-	}
+	// Release the sound card promptly instead of waiting for every control
+	// goroutine to unwind.
 	r.pipeline.Stop()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		r.mu.Lock()
-		stillActive := r.active == report
+		remaining := len(r.sessions)
 		r.mu.Unlock()
-		if !stillActive {
-			return true, nil
+		if remaining == 0 {
+			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return true, nil
+	return wasConnected, nil
 }
 
 // Status returns the MiPlay slice of /api/status.
@@ -713,6 +872,46 @@ func isTimeout(err error) bool {
 // session mutex: the control loop, the WFD goroutine and HTTP status readers
 // touch these fields concurrently.
 
+// touch records activity. Both the control loop and the media reader call it.
+func (s *sessionRuntime) touch() {
+	s.mu.Lock()
+	s.lastActivity = time.Now()
+	s.mu.Unlock()
+}
+
+func (s *sessionRuntime) lastActivityAt() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastActivity
+}
+
+func (s *sessionRuntime) connection() net.Conn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn
+}
+
+// beginWFD cancels any previous media leg and returns a fresh child context
+// plus a generation token. The token lets a superseded goroutine exit without
+// closing the control connection of the newer leg.
+func (s *sessionRuntime) beginWFD(parent context.Context) (context.Context, uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cancelWFD != nil {
+		s.cancelWFD()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	s.cancelWFD = cancel
+	s.wfdGeneration++
+	return ctx, s.wfdGeneration
+}
+
+func (s *sessionRuntime) isCurrentWFD(generation uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.wfdGeneration == generation
+}
+
 func (s *sessionRuntime) setError(message string) {
 	s.mu.Lock()
 	// Keep the first failure: follow-up errors (for example the control read
@@ -749,6 +948,27 @@ func (s *sessionRuntime) addMedia(bytes int64) {
 	s.mu.Unlock()
 }
 
+func (s *sessionRuntime) recordMediaGap(gap time.Duration) {
+	ms := gap.Milliseconds()
+	s.mu.Lock()
+	s.mediaGaps++
+	s.mediaGapTotal += ms
+	if ms > s.mediaGapMaxMS {
+		s.mediaGapMaxMS = ms
+	}
+	s.mu.Unlock()
+}
+
+func (s *sessionRuntime) recordWriteBlock(blocked time.Duration) {
+	ms := blocked.Milliseconds()
+	s.mu.Lock()
+	s.writeBlocks++
+	if ms > s.writeBlockMax {
+		s.writeBlockMax = ms
+	}
+	s.mu.Unlock()
+}
+
 func (s *sessionRuntime) isPaused() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -771,17 +991,22 @@ func (s *sessionRuntime) summary(session *LegacyReceiverSession) *SessionSummary
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return &SessionSummary{
-		Peer:          s.peer,
-		StartedAt:     s.startedAt,
-		EndedAt:       time.Now().UTC(),
-		Authenticated: session.Authenticated(),
-		ControlFrames: s.controlFrames,
-		Safety:        session.SafetyDiagnostics(),
-		RTSPReady:     s.rtspReady,
-		WFDUnstable:   s.wfdEvents,
-		MediaFrames:   s.mediaFrames,
-		MediaBytes:    s.mediaBytes,
-		Error:         s.lastError,
-		Trace:         session.Trace(),
+		Peer:            s.peer,
+		StartedAt:       s.startedAt,
+		EndedAt:         time.Now().UTC(),
+		Authenticated:   session.Authenticated(),
+		ControlFrames:   s.controlFrames,
+		Safety:          session.SafetyDiagnostics(),
+		RTSPReady:       s.rtspReady,
+		WFDUnstable:     s.wfdEvents,
+		MediaFrames:     s.mediaFrames,
+		MediaBytes:      s.mediaBytes,
+		MediaGaps:       s.mediaGaps,
+		MediaGapMaxMS:   s.mediaGapMaxMS,
+		MediaGapTotalMS: s.mediaGapTotal,
+		WriteBlocks:     s.writeBlocks,
+		WriteBlockMaxMS: s.writeBlockMax,
+		Error:           s.lastError,
+		Trace:           session.Trace(),
 	}
 }

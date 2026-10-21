@@ -46,7 +46,7 @@ services:
       ALSA_PCM_DEVICE: "0"
       # 妙播协议软件增益的初始值（0-100），与硬件混音器无关。
       # DLNA 内核增益默认 100，由控制端通过 RenderingControl 设置。
-      # BRIDGE_VOLUME_DEFAULT: "40"
+      BRIDGE_VOLUME_DEFAULT: "40"
       # amixer 二进制路径（容器内由 alsa-utils 提供，通常无需修改）。
       # AMIXER_PATH: "amixer"
       # 小米妙播功能开关及在手机端显示的设备名。

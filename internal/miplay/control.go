@@ -50,9 +50,10 @@ type ControlResult struct {
 
 // TraceEntry is one control frame for the last-session diagnostics.
 type TraceEntry struct {
-	Command      string `json:"command"`
-	Sequence     int    `json:"sequence"`
-	PayloadBytes int    `json:"payload_bytes"`
+	Command       string `json:"command"`
+	Sequence      int    `json:"sequence"`
+	PayloadBytes  int    `json:"payload_bytes"`
+	Authenticated bool   `json:"authenticated"`
 }
 
 // LegacyReceiverSession is the receiver side of one 8899 control connection.
@@ -68,15 +69,16 @@ type LegacyReceiverSession struct {
 	challengeSequence uint16
 	friendlyName      string
 	volume            int
-	// volumeProvider, when wired, reports the live hardware volume. The
-	// session answers GET_VOLUME with it so a level the console or the phone
-	// changed after the connection was established is reported truthfully.
-	// Invoked with the session lock held.
+	// volumeProvider, when wired, reports the receiver-wide live level. GET_VOLUME
+	// answers it so a poll on a connection that never carried SET_VOLUME still
+	// sees the newest value instead of the snapshot taken when it was opened.
+	// Invoked with mu held.
 	volumeProvider func() (int, bool)
 
 	phase             ControlPhase
 	authenticated     bool
 	sourceVersion     string
+	sourceVersionSeen bool
 	sourceName        string
 	mediaInfo         map[string]string
 	setPlaySourceSeen bool
@@ -164,8 +166,8 @@ func (s *LegacyReceiverSession) Volume() int {
 	return s.volume
 }
 
-// SetVolumeProvider wires the live hardware-volume reader used to answer
-// GET_VOLUME. A nil provider keeps the session's own copy authoritative.
+// SetVolumeProvider wires the live level reader used to answer GET_VOLUME. A
+// nil provider keeps the session's own copy authoritative.
 func (s *LegacyReceiverSession) SetVolumeProvider(provider func() (int, bool)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -243,16 +245,25 @@ func (s *LegacyReceiverSession) MediaStarted(write func([][]byte) error) error {
 }
 
 func (s *LegacyReceiverSession) notify(label string, value byte) []byte {
+	return EncodeCommand(CmdNotify, s.nextNotificationSequence(), EncodeNotifyScalar(label, value))
+}
+
+func (s *LegacyReceiverSession) notifyUint32(label string, value uint32) []byte {
+	return EncodeCommand(CmdNotify, s.nextNotificationSequence(), EncodeNotifyUint32(label, value))
+}
+
+func (s *LegacyReceiverSession) nextNotificationSequence() uint16 {
 	sequence := s.notificationSeq
 	s.notificationSeq = (sequence + 1) & 0xFFFF
-	return EncodeCommand(CmdNotify, sequence, EncodeNotifyScalar(label, value))
+	return sequence
 }
 
 func (s *LegacyReceiverSession) record(frame CommandFrame) {
 	s.trace = append(s.trace, TraceEntry{
-		Command:      frame.Command.String(),
-		Sequence:     int(frame.Sequence),
-		PayloadBytes: len(frame.Payload),
+		Command:       frame.Command.String(),
+		Sequence:      int(frame.Sequence),
+		PayloadBytes:  len(frame.Payload),
+		Authenticated: s.authenticated,
 	})
 	if len(s.trace) > 64 {
 		s.trace = s.trace[len(s.trace)-64:]
@@ -359,7 +370,7 @@ func (s *LegacyReceiverSession) processSafety(frame CommandFrame) (ControlResult
 }
 
 func (s *LegacyReceiverSession) sourceVersionStep(frame CommandFrame) (ControlResult, error) {
-	if s.sourceVersion != "" {
+	if s.sourceVersionSeen {
 		return s.stop("duplicate source version")
 	}
 	if len(frame.Payload) == 0 || frame.Payload[len(frame.Payload)-1] != 0 {
@@ -370,6 +381,7 @@ func (s *LegacyReceiverSession) sourceVersionStep(frame CommandFrame) (ControlRe
 		return s.stop("source version is not ASCII")
 	}
 	s.sourceVersion = string(value)
+	s.sourceVersionSeen = true
 	reply := append([]byte(controlSourceVersion), 0)
 	return s.ok([][]byte{EncodeCommand(CmdSourceVersionAck, frame.Sequence, reply)}, "source version acknowledged"), nil
 }
@@ -395,7 +407,7 @@ func (s *LegacyReceiverSession) processBusiness(frame CommandFrame) (ControlResu
 		}
 		payload, err := EncodeDeviceInfo([]DeviceInfoField{
 			{Name: "name", Value: s.friendlyName},
-			{Name: "model", Value: "miplay.bridge"},
+			{Name: "model", Value: "miplaybridge.gateway"},
 			{Name: "support", Value: "audio"},
 			{Name: "mirrorMode", Value: "2"},
 		})
@@ -405,15 +417,12 @@ func (s *LegacyReceiverSession) processBusiness(frame CommandFrame) (ControlResu
 		return s.ack(CmdGetDeviceInfoAck, frame.Sequence, payload), nil
 
 	case CmdSetLocalDeviceInfo:
-		var payload map[string]any
-		if err := json.Unmarshal(frame.Payload, &payload); err != nil {
-			return s.stop("setLocalDeviceInfo payload is not JSON")
+		payload, reason := decodeJSONObject(frame.Payload)
+		if reason != "" {
+			return s.stop("setLocalDeviceInfo payload is " + reason)
 		}
 		if sourceName, ok := payload["sourceName"].(string); ok && sourceName != "" {
-			if len(sourceName) > 120 {
-				sourceName = sourceName[:120]
-			}
-			s.sourceName = sourceName
+			s.sourceName = truncateRunes(sourceName, 120)
 		}
 		return s.ack(CmdSetLocalDeviceInfoAck, frame.Sequence, nil), nil
 
@@ -426,31 +435,28 @@ func (s *LegacyReceiverSession) processBusiness(frame CommandFrame) (ControlResu
 		return s.emptyQueryAck(frame, CmdGetMirrorModeAck, EncodeScalar(2))
 
 	case CmdGetVolume:
-		// Answer with the current volume no matter what the inbound payload
-		// carries: the request is a pure query (the reply is the payload), so
-		// the request shape decides nothing - a modern source may wrap it in a
-		// SafetyData blob - and a volume query must never end a session. A
-		// wired provider answers the live hardware level, so the reply tracks
-		// console-side changes too and the phone's slider never springs back
-		// to a stale value.
+		// The reply payload is the answer, so the request shape decides
+		// nothing: a modern source may wrap the query in a SafetyData blob,
+		// and a volume query must never end the session. A wired provider
+		// answers the receiver-wide level, so the phone's slider cannot spring
+		// back to the value captured when its connection was opened.
 		return s.ack(CmdGetVolumeAck, frame.Sequence, EncodeScalar(uint32(s.currentVolume()))), nil
 
 	case CmdSetVolume:
-		// The payload arrives in one of two recovered shapes: the bare
-		// four-byte big-endian integer of earlier firmware, or the five-byte
-		// 0x00-tagged scalar modern MIUI sends (the EncodeScalar shape every
-		// other volume message uses). A modern source additionally wraps the
-		// command in a SafetyData blob; through an active safety channel the
-		// blob is decrypted before this handler runs, and without one
-		// decodeVolumePayload probes it directly.
-		//
-		// A malformed or undecryptable volume command is acknowledged and
-		// ignored, never fatal: the CBC IV takes a moment to settle on the
-		// encrypted channel, and tearing the session down every time the
-		// slider moves leaves the phone in a reconnect loop.
+		// SET_VOLUME arrives as a bare four-byte big-endian integer, as the
+		// five-byte 0x00-tagged scalar modern MIUI sends, or wrapped in a
+		// SafetyData blob. An undecodable command is acknowledged and ignored
+		// rather than fatal: tearing the session down on a slider move leaves
+		// the phone reconnecting with a stale level.
 		if volume, ok := s.decodeVolumePayload(frame.Payload); ok {
 			s.volume = volume
 			result := s.ack(CmdSetVolumeAck, frame.Sequence, nil)
+			// HyperOS caches the receiver level per route and restores the
+			// connection-time value unless the receiver publishes the applied
+			// level. The acknowledgement itself stays status-only; the value
+			// follows as a receiver-sequenced type-7 "volume" notification,
+			// matching MiPCAudio.
+			result.Writes = append(result.Writes, s.notifyUint32("volume", uint32(volume)))
 			result.VolumeSet = true
 			result.Volume = volume
 			return result, nil
@@ -470,15 +476,9 @@ func (s *LegacyReceiverSession) processBusiness(frame CommandFrame) (ControlResu
 	case CmdHeartbeat:
 		return s.emptyQueryAck(frame, CmdHeartbeatAck, []byte{})
 
-	case CmdGetPosition:
-		// Defensive extension over the reference table: answer the tolerant
-		// scalar instead of tearing the session down on a stray query.
-		return s.emptyQueryAck(frame, CmdGetPositionAck, EncodeScalar(0))
-
 	case CmdSetPlaySource:
-		var payload map[string]any
-		if err := json.Unmarshal(frame.Payload, &payload); err != nil {
-			return s.stop("setPlaySource payload is not JSON")
+		if _, reason := decodeJSONObject(frame.Payload); reason != "" {
+			return s.stop("setPlaySource payload is " + reason)
 		}
 		s.setPlaySourceSeen = true
 		return s.ok(nil, "play source observed"), nil
@@ -495,9 +495,9 @@ func (s *LegacyReceiverSession) processBusiness(frame CommandFrame) (ControlResu
 		return ControlResult{Accepted: true, Reason: "WFD source endpoint accepted", OpenRequest: &request}, nil
 
 	case CmdSetMediaInfo:
-		var payload map[string]any
-		if err := json.Unmarshal(frame.Payload, &payload); err != nil {
-			return s.stop("setMediaInfo payload is not JSON")
+		payload, reason := decodeJSONObject(frame.Payload)
+		if reason != "" {
+			return s.stop("setMediaInfo payload is " + reason)
 		}
 		s.captureMediaInfo(payload)
 		return s.ack(CmdSetMediaInfoAck, frame.Sequence, nil), nil
@@ -519,6 +519,35 @@ func (s *LegacyReceiverSession) processBusiness(frame CommandFrame) (ControlResu
 		return result, nil
 	}
 	return s.stop(fmt.Sprintf("unsupported legacy command %s", frame.Command))
+}
+
+// decodeJSONObject decodes a JSON object payload. A JSON array, scalar, or
+// null is not an object and is rejected, matching the reference parser. The
+// returned reason is empty on success and otherwise reads like the reference
+// diagnostic ("not JSON" / "not an object").
+func decodeJSONObject(payload []byte) (map[string]any, string) {
+	var value any
+	if err := json.Unmarshal(payload, &value); err != nil {
+		return nil, "not JSON"
+	}
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil, "not an object"
+	}
+	return object, ""
+}
+
+// truncateRunes caps a string at limit Unicode code points, mirroring the
+// reference implementation's Python string slicing.
+func truncateRunes(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit])
 }
 
 // captureMediaInfo best-effort extracts title/artist/album from the metadata
@@ -543,13 +572,16 @@ func (s *LegacyReceiverSession) captureMediaInfo(payload map[string]any) {
 	}
 }
 
-// decodeVolumePayload reads a SET_VOLUME payload in any of the recovered
-// shapes: a bare scalar, or a SafetyData blob wrapping a scalar. The blob
-// probe re-derives the protocol key material from the TCP endpoints and tries
-// the two recovered IV candidates in the same order as
-// NewModernSafetyReceiver. It runs on a fresh cipher and never mutates the
-// live safety channel, so a blob the channel itself will handle later is not
-// disturbed, and a probe miss just leaves the command ignored.
+func (s *LegacyReceiverSession) emptyQueryAck(frame CommandFrame, command Command, payload []byte) (ControlResult, error) {
+	if len(frame.Payload) != 0 {
+		return s.stop(fmt.Sprintf("command %s payload must be empty", frame.Command))
+	}
+	return s.ack(command, frame.Sequence, payload), nil
+}
+
+// decodeVolumePayload reads SET_VOLUME in the recovered shapes: a plain scalar
+// or a SafetyData blob wrapping one. The blob probe uses fresh ciphers, so it
+// never disturbs the live safety channel's CBC state.
 func (s *LegacyReceiverSession) decodeVolumePayload(payload []byte) (int, bool) {
 	if volume, ok := decodeVolumeScalar(payload); ok {
 		return volume, true
@@ -575,10 +607,9 @@ func (s *LegacyReceiverSession) decodeVolumePayload(payload []byte) (int, bool) 
 	return 0, false
 }
 
-// decodeVolumeScalar reads a volume in 0..100 from either recovered scalar
-// shape: a four-byte big-endian integer, or the five-byte 0x00-tagged scalar.
-// Out-of-range values are rejected so a malformed frame is skipped instead of
-// clamping the mixer.
+// decodeVolumeScalar reads 0..100 from a four-byte integer or the five-byte
+// 0x00-tagged scalar. Out-of-range values are rejected instead of clamped so a
+// malformed frame is skipped.
 func decodeVolumeScalar(payload []byte) (int, bool) {
 	switch {
 	case len(payload) == 4:
@@ -594,9 +625,8 @@ func decodeVolumeScalar(payload []byte) (int, bool) {
 	return int(value), true
 }
 
-// currentVolume resolves the level GET_VOLUME answers with: the live hardware
-// level when a provider is wired and reports a sane value, else the session's
-// own copy. The caller must hold mu.
+// currentVolume resolves the level GET_VOLUME answers with. The caller must
+// hold mu.
 func (s *LegacyReceiverSession) currentVolume() int {
 	if s.volumeProvider != nil {
 		if volume, ok := s.volumeProvider(); ok && volume >= 0 && volume <= 100 {
@@ -604,13 +634,6 @@ func (s *LegacyReceiverSession) currentVolume() int {
 		}
 	}
 	return s.volume
-}
-
-func (s *LegacyReceiverSession) emptyQueryAck(frame CommandFrame, command Command, payload []byte) (ControlResult, error) {
-	if len(frame.Payload) != 0 {
-		return s.stop(fmt.Sprintf("command %s payload must be empty", frame.Command))
-	}
-	return s.ack(command, frame.Sequence, payload), nil
 }
 
 func (s *LegacyReceiverSession) ack(command Command, sequence uint16, payload []byte) ControlResult {

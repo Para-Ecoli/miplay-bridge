@@ -2,12 +2,13 @@
 // advertising, the binary TCP control protocol on port 8899, the optional
 // SafetyData encrypted channel and the reverse-WFD realtime audio pipeline.
 //
-// The wire behaviour implemented here was recovered from publicly documented
-// capture-driven research (see README "协议研究与致谢"). The protocol is
-// proprietary and undocumented by Xiaomi; the implementation is an
-// independent clean-room Go rewrite of the observed byte contracts, written
-// against the constraints captured in the reference notes. No third-party
-// protocol code is vendored.
+// The wire behaviour implemented here is kept byte-for-byte compatible with
+// the MiplayBridgePython reference implementation (miplaybridge/miplay/*.py):
+// the same command table, frame codecs, legacy HMAC-SHA1 challenge, modern
+// SafetyData AES-CBC channel, reverse-WFD RTSP ladder and MPEG-TS media
+// framing. The protocol is proprietary and undocumented by Xiaomi; this
+// package is an independent Go rewrite of the observed byte contracts. No
+// third-party protocol code is vendored.
 package miplay
 
 import (
@@ -20,9 +21,11 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // Magic is the first byte of every MiPlay command frame and of every wire
@@ -264,6 +267,9 @@ func DecodeDeviceInfo(payload []byte) (map[string]string, error) {
 		}
 		name := string(payload[offset : offset+nameLength])
 		offset += nameLength
+		if !isASCII(name) {
+			return nil, protocolErrorf("device-info name is not ASCII")
+		}
 		if payload[offset] != deviceInfoString {
 			return nil, protocolErrorf("unsupported device-info value type 0x%02x", payload[offset])
 		}
@@ -276,7 +282,11 @@ func DecodeDeviceInfo(payload []byte) (map[string]string, error) {
 		if _, duplicate := result[name]; duplicate {
 			return nil, protocolErrorf("duplicate device-info field %q", name)
 		}
-		result[name] = string(payload[offset : offset+valueLength])
+		value := payload[offset : offset+valueLength]
+		if !utf8.Valid(value) {
+			return nil, protocolErrorf("device-info value is not valid UTF-8")
+		}
+		result[name] = string(value)
 		offset += valueLength
 	}
 	return result, nil
@@ -289,6 +299,18 @@ func EncodeNotifyScalar(label string, value byte) []byte {
 	payload = append(payload, byte(len(label)))
 	payload = append(payload, label...)
 	payload = append(payload, 0x03, value)
+	return payload
+}
+
+// EncodeNotifyUint32 encodes a NOTIFY payload: [label length][label][0x07]
+// [uint32 big-endian value]. HyperOS uses this shape for the receiver's
+// "volume" publish.
+func EncodeNotifyUint32(label string, value uint32) []byte {
+	payload := make([]byte, 0, len(label)+6)
+	payload = append(payload, byte(len(label)))
+	payload = append(payload, label...)
+	payload = append(payload, 0x07)
+	payload = binary.BigEndian.AppendUint32(payload, value)
 	return payload
 }
 
@@ -338,21 +360,13 @@ func ParseOpenDeviceRequest(payload []byte, allowMissingNul bool) (OpenDeviceReq
 	return OpenDeviceRequest{Host: host, Port: port, MirrorMode: mode}, nil
 }
 
+// isIPv4 mirrors Python's ipaddress.ip_address(host).version == 4: the host
+// must be a canonical, dotted-quad IPv4 literal. net.ParseIP rejects the
+// leading-zero forms that Python also rejects, and the canonical comparison
+// keeps other non-canonical spellings out of the endpoint we dial.
 func isIPv4(host string) bool {
-	parts := strings.Split(host, ".")
-	if len(parts) != 4 {
-		return false
-	}
-	for _, part := range parts {
-		if part == "" || len(part) > 3 {
-			return false
-		}
-		value, err := strconv.Atoi(part)
-		if err != nil || value < 0 || value > 255 {
-			return false
-		}
-	}
-	return true
+	address := net.ParseIP(host)
+	return address != nil && address.To4() != nil && address.String() == host
 }
 
 func isASCII(value string) bool {

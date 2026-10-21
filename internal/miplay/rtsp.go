@@ -37,8 +37,8 @@ func (m *RTSPMessage) SetHeader(name, value string) {
 	m.Headers = append(m.Headers, rtspHeader{Name: name, Value: value})
 }
 
-// EncodeRTSP serialises a message with the captured "name:value" style (no
-// space after the colon) and automatic Content-Length handling.
+// EncodeRTSP serialises a message with the reference "Name: value" style and
+// automatic Content-Length handling.
 func EncodeRTSP(message RTSPMessage) ([]byte, error) {
 	if strings.ContainsAny(message.StartLine, "\r\n") {
 		return nil, protocolErrorf("invalid RTSP start line")
@@ -51,13 +51,13 @@ func EncodeRTSP(message RTSPMessage) ([]byte, error) {
 		}
 		if strings.EqualFold(header.Name, "Content-Length") {
 			sawLength = true
-			lines = append(lines, header.Name+":"+strconv.Itoa(len(message.Body)))
+			lines = append(lines, header.Name+": "+strconv.Itoa(len(message.Body)))
 			continue
 		}
-		lines = append(lines, header.Name+":"+header.Value)
+		lines = append(lines, header.Name+": "+header.Value)
 	}
 	if len(message.Body) > 0 && !sawLength {
-		lines = append(lines, "Content-Length:"+strconv.Itoa(len(message.Body)))
+		lines = append(lines, "Content-Length: "+strconv.Itoa(len(message.Body)))
 	}
 	encoded := []byte(strings.Join(lines, "\r\n") + "\r\n\r\n")
 	return append(encoded, message.Body...), nil
@@ -137,7 +137,6 @@ func (d *RTSPDecoder) Feed(data []byte) ([]RTSPMessage, error) {
 		body := make([]byte, bodyLength)
 		copy(body, d.buffer[headerEnd+4:messageLength])
 		d.buffer = append(d.buffer[:0], d.buffer[messageLength:]...)
-		// The decoded "Content-Length: N" header stays part of the message.
 		messages = append(messages, RTSPMessage{StartLine: lines[0], Headers: headers, Body: body})
 	}
 	return messages, nil
@@ -196,7 +195,10 @@ type ReceiverRtspSession struct {
 	phase         RTSPPhase
 	sessionID     string
 	timeOffsetUS  int64
-	timerEndpoint string
+
+	timerHost string
+	timerPort int
+	hasTimer  bool
 }
 
 // NewReceiverRtspSession creates the session for one source.
@@ -213,6 +215,12 @@ func (s *ReceiverRtspSession) Phase() RTSPPhase { return s.phase }
 
 // SessionID reports the negotiated session id, once known.
 func (s *ReceiverRtspSession) SessionID() string { return s.sessionID }
+
+// TimerEndpoint reports the optional WFD timer endpoint advertised in the
+// source OPTIONS request, decoded from its 32-bit-packed IPv4 form.
+func (s *ReceiverRtspSession) TimerEndpoint() (string, int, bool) {
+	return s.timerHost, s.timerPort, s.hasTimer
+}
 
 // Process advances the ladder. The returned transition carries the messages
 // to write; an error means the session must stop.
@@ -247,10 +255,15 @@ func (s *ReceiverRtspSession) sourceOptions(message RTSPMessage) (RTSPTransition
 	if err := requireRequest(message, "OPTIONS", 1); err != nil {
 		return RTSPTransition{}, err
 	}
-	// The timer endpoint is not needed by this receiver; record it for
-	// diagnostics but never fail the handshake over it.
-	if timer, ok := message.Header("wfd_timer_server_port"); ok {
-		s.timerEndpoint = timer
+	// The timer endpoint is not used by this receiver, but the reference
+	// implementation validates and records it, so a malformed value is a
+	// protocol violation rather than silently ignored.
+	if timer, ok := message.Header("wfd_timer_server_port"); ok && timer != "" {
+		host, port, err := parseWFDTimerEndpoint(timer)
+		if err != nil {
+			return RTSPTransition{}, err
+		}
+		s.timerHost, s.timerPort, s.hasTimer = host, port, true
 	}
 	response := s.response(1, nil)
 	receiverOptions := RTSPMessage{StartLine: "OPTIONS * RTSP/1.0"}
@@ -259,6 +272,26 @@ func (s *ReceiverRtspSession) sourceOptions(message RTSPMessage) (RTSPTransition
 	receiverOptions.SetHeader("lib_version", "audio-speaker-mico-cloud "+controlSourceVersion)
 	s.phase = RTSPAwaitingOptionsAck
 	return s.ok([]RTSPMessage{response, receiverOptions}, "bidirectional OPTIONS started", false)
+}
+
+// parseWFDTimerEndpoint decodes the source's wfd_timer_server_port header:
+// a 32-bit integer whose four octets are the IPv4 address, then the port.
+func parseWFDTimerEndpoint(value string) (string, int, error) {
+	addressText, portText, found := strings.Cut(value, ":")
+	if !found {
+		return "", 0, protocolErrorf("invalid WFD timer endpoint")
+	}
+	addressValue, err := strconv.ParseInt(strings.TrimSpace(addressText), 10, 64)
+	if err != nil {
+		return "", 0, protocolErrorf("invalid WFD timer endpoint")
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(portText))
+	if err != nil {
+		return "", 0, protocolErrorf("invalid WFD timer endpoint")
+	}
+	host := fmt.Sprintf("%d.%d.%d.%d",
+		byte(addressValue>>24), byte(addressValue>>16), byte(addressValue>>8), byte(addressValue))
+	return host, port, nil
 }
 
 func (s *ReceiverRtspSession) optionsAck(message RTSPMessage) (RTSPTransition, error) {
@@ -355,11 +388,9 @@ func (s *ReceiverRtspSession) timeOffset(message RTSPMessage) (RTSPTransition, e
 
 func (s *ReceiverRtspSession) readyRequest(message RTSPMessage) (RTSPTransition, error) {
 	method := strings.SplitN(message.StartLine, " ", 2)[0]
-	cseq := 0
-	if value, ok := message.Header("CSeq"); ok {
-		if parsed, err := strconv.Atoi(strings.TrimSpace(value)); err == nil {
-			cseq = parsed
-		}
+	cseq, err := requireCSeqValue(message)
+	if err != nil {
+		return RTSPTransition{}, err
 	}
 	switch method {
 	case "OPTIONS", "GET_PARAMETER", "SET_PARAMETER":
@@ -413,13 +444,28 @@ func requireResponse(message RTSPMessage, cseq int) error {
 }
 
 func requireCSeq(message RTSPMessage, cseq int) error {
-	value, ok := message.Header("CSeq")
-	if !ok {
-		return protocolErrorf("RTSP message omitted numeric CSeq")
+	parsed, err := requireCSeqValue(message)
+	if err != nil {
+		return err
 	}
-	parsed, err := strconv.Atoi(strings.TrimSpace(value))
-	if err != nil || parsed != cseq {
+	if parsed != cseq {
+		value, _ := message.Header("CSeq")
 		return protocolErrorf("expected RTSP CSeq %d, got %q", cseq, value)
 	}
 	return nil
+}
+
+// requireCSeqValue returns the numeric CSeq header, or an error when the
+// message omits it. Every RTSP message in the receiver ladder, including
+// ready-state keepalives, must carry one.
+func requireCSeqValue(message RTSPMessage) (int, error) {
+	value, ok := message.Header("CSeq")
+	if !ok {
+		return 0, protocolErrorf("RTSP message omitted numeric CSeq")
+	}
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return 0, protocolErrorf("RTSP message omitted numeric CSeq")
+	}
+	return parsed, nil
 }

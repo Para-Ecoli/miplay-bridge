@@ -27,10 +27,10 @@ func TestEncodeRTSPHandlesContentLength(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(encoded), "CSeq:2\r\n") {
-		t.Fatalf("encoded = %q, want the captured no-space header style", encoded)
+	if !strings.Contains(string(encoded), "CSeq: 2\r\n") {
+		t.Fatalf("encoded = %q, want the reference \"Name: value\" header style", encoded)
 	}
-	if !strings.Contains(string(encoded), "Content-Length:"+strconv.Itoa(len(body))+"\r\n") {
+	if !strings.Contains(string(encoded), "Content-Length: "+strconv.Itoa(len(body))+"\r\n") {
 		t.Fatalf("encoded = %q, want a corrected Content-Length", encoded)
 	}
 	if !bytes.HasSuffix(encoded, body) {
@@ -44,7 +44,7 @@ func TestEncodeRTSPHandlesContentLength(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(encoded), "Content-Length:1\r\n") {
+	if !strings.Contains(string(encoded), "Content-Length: 1\r\n") {
 		t.Fatalf("encoded = %q, want an automatic Content-Length", encoded)
 	}
 }
@@ -160,7 +160,7 @@ func TestReceiverRtspSessionLadder(t *testing.T) {
 	if len(transition.Writes) != 2 {
 		t.Fatalf("writes = %d, want the response plus the mirrored OPTIONS", len(transition.Writes))
 	}
-	if !strings.Contains(string(transition.Writes[1]), "Require:org.wfa.wfd1.0") {
+	if !strings.Contains(string(transition.Writes[1]), "Require: org.wfa.wfd1.0") {
 		t.Fatalf("mirrored OPTIONS = %q", transition.Writes[1])
 	}
 
@@ -182,7 +182,7 @@ func TestReceiverRtspSessionLadder(t *testing.T) {
 		t.Fatalf("writes = %d, want the capability body", len(transition.Writes))
 	}
 	capabilities := string(transition.Writes[0])
-	for _, expected := range []string{"wfd_audio_codecs: AAC 00000001 00", "RTP/AVP/TCP", "Content-Type:text/parameters"} {
+	for _, expected := range []string{"wfd_audio_codecs: AAC 00000001 00", "RTP/AVP/TCP", "Content-Type: text/parameters"} {
 		if !strings.Contains(capabilities, expected) {
 			t.Fatalf("capability body missing %q:\n%s", expected, capabilities)
 		}
@@ -204,7 +204,7 @@ func TestReceiverRtspSessionLadder(t *testing.T) {
 	if len(transition.Writes) != 2 {
 		t.Fatalf("writes = %d, want the response plus SETUP", len(transition.Writes))
 	}
-	if !strings.Contains(string(transition.Writes[1]), "Transport:RTP/AVP/TCP;interleaved=0-1") {
+	if !strings.Contains(string(transition.Writes[1]), "Transport: RTP/AVP/TCP;interleaved=0-1") {
 		t.Fatalf("SETUP = %q", transition.Writes[1])
 	}
 
@@ -220,7 +220,7 @@ func TestReceiverRtspSessionLadder(t *testing.T) {
 	if session.SessionID() != "1234567890" {
 		t.Fatalf("session = %q", session.SessionID())
 	}
-	if !strings.Contains(string(transition.Writes[0]), "Session:1234567890") {
+	if !strings.Contains(string(transition.Writes[0]), "Session: 1234567890") {
 		t.Fatalf("PLAY = %q", transition.Writes[0])
 	}
 
@@ -243,6 +243,29 @@ func TestReceiverRtspSessionLadder(t *testing.T) {
 	}
 	if !transition.Accepted || !transition.Ready || len(transition.Writes) != 1 {
 		t.Fatalf("keepalive transition = %+v", transition)
+	}
+}
+
+func TestReceiverRtspSessionDecodesTimerEndpoint(t *testing.T) {
+	session := NewReceiverRtspSession("192.168.1.20")
+	options := rtspRequest("OPTIONS * RTSP/1.0", "1", map[string]string{
+		"wfd_timer_server_port": "2130706433:36524",
+	}, nil)
+	if _, err := session.Process(options); err != nil {
+		t.Fatal(err)
+	}
+	host, port, ok := session.TimerEndpoint()
+	if !ok || host != "127.0.0.1" || port != 36524 {
+		t.Fatalf("timer endpoint = %q:%d ok=%v", host, port, ok)
+	}
+
+	// A malformed timer header is a protocol violation in the reference
+	// implementation, not silently ignored.
+	session = NewReceiverRtspSession("192.168.1.20")
+	if _, err := session.Process(rtspRequest("OPTIONS * RTSP/1.0", "1", map[string]string{
+		"wfd_timer_server_port": "not-a-number",
+	}, nil)); err == nil {
+		t.Fatal("a malformed timer endpoint must be rejected")
 	}
 }
 
@@ -294,5 +317,11 @@ func TestReceiverRtspSessionRejectsUnexpectedMessages(t *testing.T) {
 	driveSession(t, session, RTSPReady)
 	if _, err := session.Process(rtspRequest("PLAY rtsp://source/wfd1.0/streamid=0 RTSP/1.0", "9", nil, nil)); err == nil {
 		t.Fatal("an unknown ready-state method must be rejected")
+	}
+	// Ready-state keepalives still need a numeric CSeq.
+	session = NewReceiverRtspSession("192.168.1.20")
+	driveSession(t, session, RTSPReady)
+	if _, err := session.Process(rtspRequest("OPTIONS * RTSP/1.0", "", nil, nil)); err == nil {
+		t.Fatal("a ready-state request without CSeq must be rejected")
 	}
 }

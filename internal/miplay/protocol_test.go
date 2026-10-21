@@ -64,10 +64,12 @@ func TestFrameDecoderRejectsOversizePayload(t *testing.T) {
 }
 
 func TestLegacyChallengeResponseFixedVectors(t *testing.T) {
-	// Vectors computed independently with md5sum + openssl (see README).
+	// Vectors computed independently with md5sum + openssl (see README), plus
+	// the exact vector pinned by the MiplayBridgePython test suite.
 	cases := []struct{ challenge, want string }{
 		{"123456789012345", "3bc94de4f054fc1c5bfcc839ec4c66774bf8d3bc"},
 		{"98765432109876543210", "1a8cb350617d9c273c3b8299b2153e371199b8b2"},
+		{"legacy-challenge", "1bfbbecf1244c16add4362959aa0ccc7b6e8a0c4"},
 	}
 	for _, testCase := range cases {
 		if got := string(LegacyChallengeResponse([]byte(testCase.challenge))); got != testCase.want {
@@ -185,6 +187,16 @@ func TestEncodeNotifyScalar(t *testing.T) {
 	}
 }
 
+// TestEncodeNotifyUint32 pins the reference receiver's "volume" publish:
+// label "volume", value type 0x07, uint32 big-endian.
+func TestEncodeNotifyUint32(t *testing.T) {
+	payload := EncodeNotifyUint32("volume", 55)
+	want := []byte{0x06, 'v', 'o', 'l', 'u', 'm', 'e', 0x07, 0x00, 0x00, 0x00, 0x37}
+	if !bytes.Equal(payload, want) {
+		t.Fatalf("payload = % x, want % x", payload, want)
+	}
+}
+
 func TestParseOpenDeviceRequest(t *testing.T) {
 	request, err := ParseOpenDeviceRequest([]byte("wfd://192.168.1.20:7236?mirrorMode=0\x00"), false)
 	if err != nil {
@@ -211,6 +223,7 @@ func TestParseOpenDeviceRequest(t *testing.T) {
 		"wfd://192.168.1.20:7236?mirrorMode=x\x00",
 		"wfd://192.168.1.20:7236?mirrorMode=0\x00trailing",
 		"wfd://192.168.1.2\x000:7236?mirrorMode=0\x00",
+		"wfd://192.168.001.20:7236?mirrorMode=0\x00",
 	}
 	for _, raw := range invalid {
 		if _, err := ParseOpenDeviceRequest([]byte(raw), false); err == nil {

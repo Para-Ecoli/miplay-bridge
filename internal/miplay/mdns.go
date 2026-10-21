@@ -63,6 +63,12 @@ func (i Identity) IDHash() string {
 // AppsData is the base64 container carrying the 25-byte header plus the
 // identity JSON, as observed in the TXT record.
 func (i Identity) AppsData() (string, error) {
+	if len(i.DeviceID) != 16 {
+		return "", protocolErrorf("MiPlay appsData requires a 16-byte device UUID")
+	}
+	if i.ControlPort < 1 || i.ControlPort > 65535 {
+		return "", protocolErrorf("MiPlay appsData control port is out of range")
+	}
 	jsonBytes := []byte(fmt.Sprintf(`{"mico":{"device_id":"%s"}}`, i.canonicalUUID()))
 	payload := make([]byte, 25+len(jsonBytes))
 	binary.BigEndian.PutUint16(payload[0:2], 1155)
@@ -77,6 +83,24 @@ func (i Identity) AppsData() (string, error) {
 	}
 	container := append([]byte{0x81, 0x00, byte(len(payload))}, payload...)
 	return base64.StdEncoding.EncodeToString(container), nil
+}
+
+// DecodeAppsData validates the base64 TXT container and returns the inner
+// 25-byte-plus-JSON payload. It is the counterpart of Identity.AppsData and
+// matches the reference decoder's bounds checks.
+func DecodeAppsData(value string) ([]byte, error) {
+	container, err := base64.StdEncoding.DecodeString(value)
+	if err != nil {
+		return nil, fmt.Errorf("invalid MiPlay appsData base64: %w", err)
+	}
+	if len(container) < 3 || container[0] != 0x81 || container[1] != 0x00 {
+		return nil, protocolErrorf("unsupported MiPlay appsData container")
+	}
+	length := int(container[2])
+	if len(container) != 3+length {
+		return nil, protocolErrorf("MiPlay appsData length mismatch")
+	}
+	return container[3:], nil
 }
 
 func (i Identity) canonicalUUID() string {
@@ -161,6 +185,29 @@ func sanitizeLabel(value, fallback string) string {
 		result = result[:63]
 	}
 	return result
+}
+
+// identityLabels derives the default DNS-SD instance label and hostname from
+// the friendly name and the persistent device UUID. The six-hex-digit suffix
+// mirrors the reference configuration scheme: stable across restarts, unique
+// between two bridges with the same friendly name.
+func identityLabels(friendlyName string, deviceID []byte) (string, string) {
+	suffix := "000000"
+	if len(deviceID) >= 3 {
+		suffix = hex.EncodeToString(deviceID[:3])
+	}
+	base := sanitizeLabel(friendlyName, "MiplayBridge")
+	room := 63 - len(suffix) - 1
+	if room < 1 {
+		room = 1
+	}
+	if len(base) > room {
+		base = strings.Trim(base[:room], "-")
+		if base == "" {
+			base = "MiplayBridge"
+		}
+	}
+	return base + "-" + suffix, "miplaybridge-" + suffix
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +323,12 @@ type ResponderConfig struct {
 	FriendlyName string
 	ControlPort  int
 	DeviceIDFile string
+	// Instance and Host optionally override the DNS-SD instance label and
+	// hostname. When empty they are derived from the friendly name and the
+	// persistent device UUID, so two bridges on the same LAN never collide and
+	// the identity survives a restart.
+	Instance string
+	Host     string
 }
 
 // Responder advertises the receiver over mDNS and answers PTR/SRV/TXT/A
@@ -315,10 +368,20 @@ func (r *Responder) Start(ctx context.Context, advertiseAddress string) error {
 	if err != nil {
 		return err
 	}
+	instance, host := r.cfg.Instance, r.cfg.Host
+	if instance == "" || host == "" {
+		defaultInstance, defaultHost := identityLabels(r.cfg.FriendlyName, deviceID)
+		if instance == "" {
+			instance = defaultInstance
+		}
+		if host == "" {
+			host = defaultHost
+		}
+	}
 	r.client = Identity{
 		FriendlyName: r.cfg.FriendlyName,
-		Instance:     sanitizeLabel(r.cfg.FriendlyName, "MiPlay-Bridge"),
-		Host:         "miplay-bridge",
+		Instance:     instance,
+		Host:         host,
 		DeviceID:     deviceID,
 		ControlPort:  r.cfg.ControlPort,
 		Address:      address.To4(),

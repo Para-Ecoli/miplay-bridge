@@ -32,8 +32,11 @@ func TestDefaultCoversReceiverAndRenderer(t *testing.T) {
 	if cfg.MiPlayControlPort != 8899 {
 		t.Fatalf("MiPlayControlPort = %d, want the Mi-connect convention 8899", cfg.MiPlayControlPort)
 	}
-	if cfg.MiPlayAlsaBufferUS != 200000 {
-		t.Fatalf("MiPlayAlsaBufferUS = %d, want 200000", cfg.MiPlayAlsaBufferUS)
+	if cfg.MiPlayAlsaBufferUS != 500000 {
+		t.Fatalf("MiPlayAlsaBufferUS = %d, want 500000", cfg.MiPlayAlsaBufferUS)
+	}
+	if cfg.MiPlayPrebufferUS != 1000000 {
+		t.Fatalf("MiPlayPrebufferUS = %d, want the 1s jitter cushion", cfg.MiPlayPrebufferUS)
 	}
 	if !cfg.DLNAEnabled {
 		t.Fatal("DLNAEnabled must default to true")
@@ -67,6 +70,7 @@ func TestLoadReadsEnvironment(t *testing.T) {
 	t.Setenv("BRIDGE_TEST_TONE_HZ", "1000")
 	t.Setenv("MIPLAY_CONTROL_PORT", "9987")
 	t.Setenv("MIPLAY_ALSA_BUFFER_US", "350000")
+	t.Setenv("MIPLAY_PREBUFFER_US", "600000")
 	t.Setenv("DLNA_ENABLED", "false")
 
 	cfg, err := Load()
@@ -93,6 +97,9 @@ func TestLoadReadsEnvironment(t *testing.T) {
 	}
 	if cfg.MiPlayAlsaBufferUS != 350000 {
 		t.Fatalf("MiPlayAlsaBufferUS = %d", cfg.MiPlayAlsaBufferUS)
+	}
+	if cfg.MiPlayPrebufferUS != 600000 {
+		t.Fatalf("MiPlayPrebufferUS = %d", cfg.MiPlayPrebufferUS)
 	}
 	if cfg.DLNAEnabled {
 		t.Fatal("DLNA_ENABLED=false must disable the renderer")

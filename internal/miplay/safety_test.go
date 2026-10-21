@@ -121,6 +121,8 @@ func TestDeriveType1AuthKeyFixedVectors(t *testing.T) {
 	}{
 		{"127.0.0.1", 8899, "127.0.0.1", 54321, "935b8b69b84f0e21402eab9b3bf78e04"},
 		{"192.168.1.10", 8899, "192.168.1.20", 54321, "cc29ed79c60e6ab0d592123a325b3797"},
+		// The exact vector pinned by the MiplayBridgePython test suite.
+		{"192.168.10.7", 8899, "192.168.10.20", 43720, "a565e5251cce7d9995e34b18bb656c33"},
 	}
 	for _, testCase := range cases {
 		got := string(deriveType1AuthKey(testCase.localHost, testCase.localPort, testCase.peerHost, testCase.peerPort))

@@ -28,8 +28,14 @@ func newControlTestHarness(t *testing.T, handshakeTimeout time.Duration) *contro
 
 func newControlTestHarnessWithHooks(t *testing.T, handshakeTimeout time.Duration, hooks Hooks) *controlTestHarness {
 	t.Helper()
+	return newControlTestHarnessWithTimeouts(t, handshakeTimeout, 180*time.Second, hooks)
+}
+
+func newControlTestHarnessWithTimeouts(t *testing.T, handshakeTimeout, idleTimeout time.Duration, hooks Hooks) *controlTestHarness {
+	t.Helper()
 	cfg := config.Default()
 	cfg.MiPlayHandshakeTimeout = handshakeTimeout
+	cfg.MiPlaySessionIdleTimeout = idleTimeout
 	receiver := NewReceiver(cfg, discardLogger(), hooks)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -153,12 +159,16 @@ func TestControlVolumeCommandsDriveTheSoftwareGain(t *testing.T) {
 		t.Fatalf("reply = %+v, want the initial gain %d", frame, want)
 	}
 
-	if _, err := harness.client.Write(EncodeCommand(CmdSetVolume, 5, EncodeScalar(64))); err != nil {
+	if _, err := harness.client.Write(EncodeCommand(CmdSetVolume, 5, []byte{0, 0, 0, 64})); err != nil {
 		t.Fatalf("write set volume: %v", err)
 	}
 	frame = readCommandFrame(t, harness.client)
 	if frame.Command != CmdSetVolumeAck || frame.Sequence != 5 {
 		t.Fatalf("reply = %+v, want the set-volume acknowledgement", frame)
+	}
+	publish := readCommandFrame(t, harness.client)
+	if publish.Command != CmdNotify || !bytes.Equal(publish.Payload, EncodeNotifyUint32("volume", 64)) {
+		t.Fatalf("publish = %+v, want the applied level notification", publish)
 	}
 	if got := harness.receiver.pipeline.currentGain(); got != 64 {
 		t.Fatalf("pipeline gain = %d, want the accepted 64", got)
@@ -169,6 +179,98 @@ func TestControlVolumeCommandsDriveTheSoftwareGain(t *testing.T) {
 	frame = readCommandFrame(t, harness.client)
 	if frame.Command != CmdGetVolumeAck || frame.Sequence != 6 || !bytes.Equal(frame.Payload, EncodeScalar(64)) {
 		t.Fatalf("reply = %+v, want the accepted gain 64", frame)
+	}
+}
+
+// TestGetVolumeReflectsGainSetOnAnotherConnection pins the spring-back fix:
+// the phone may keep one control socket for volume polling and send
+// SET_VOLUME on another. GET_VOLUME must report the receiver-wide gain, not
+// the level captured when the polling connection was established.
+func TestGetVolumeReflectsGainSetOnAnotherConnection(t *testing.T) {
+	cfg := config.Default()
+	cfg.MiPlayHandshakeTimeout = 5 * time.Second
+	cfg.MiPlaySessionIdleTimeout = time.Minute
+	receiver := NewReceiver(cfg, discardLogger(), Hooks{})
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			connection, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go receiver.handleControl(context.Background(), connection)
+		}
+	}()
+
+	dial := func() net.Conn {
+		t.Helper()
+		connection, dialErr := net.Dial("tcp", listener.Addr().String())
+		if dialErr != nil {
+			t.Fatalf("dial: %v", dialErr)
+		}
+		t.Cleanup(func() { _ = connection.Close() })
+		return connection
+	}
+	authenticate := func(connection net.Conn) {
+		t.Helper()
+		frame := readCommandFrame(t, connection)
+		if frame.Command != CmdLegacyChallenge {
+			t.Fatalf("first frame = %s, want the legacy challenge", frame.Command)
+		}
+		ack := EncodeCommand(CmdLegacyChallengeAck, 0, LegacyChallengeResponse(frame.Payload))
+		if _, writeErr := connection.Write(ack); writeErr != nil {
+			t.Fatalf("write challenge ack: %v", writeErr)
+		}
+	}
+	query := func(connection net.Conn) int {
+		t.Helper()
+		if _, writeErr := connection.Write(EncodeCommand(CmdGetVolume, 3, nil)); writeErr != nil {
+			t.Fatalf("write get volume: %v", writeErr)
+		}
+		frame := readCommandFrame(t, connection)
+		if frame.Command != CmdGetVolumeAck {
+			t.Fatalf("reply = %s, want GET_VOLUME_ACK", frame.Command)
+		}
+		value, decodeErr := DecodeScalar(frame.Payload)
+		if decodeErr != nil {
+			t.Fatalf("decode volume: %v", decodeErr)
+		}
+		return int(value)
+	}
+
+	polling := dial()
+	authenticate(polling)
+	writer := dial()
+	authenticate(writer)
+
+	initial := config.Default().VolumeDefault
+	if got := query(polling); got != initial {
+		t.Fatalf("initial volume = %d, want %d", got, initial)
+	}
+	if _, err := writer.Write(EncodeCommand(CmdSetVolume, 2, []byte{0, 0, 0, 37})); err != nil {
+		t.Fatalf("write set volume: %v", err)
+	}
+	if frame := readCommandFrame(t, writer); frame.Command != CmdSetVolumeAck {
+		t.Fatalf("reply = %s, want SET_VOLUME_ACK", frame.Command)
+	}
+
+	// applyGain runs just after the acknowledgement is written, so allow a
+	// short settle window before asserting the poll's answer.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got := query(polling)
+		if got == 37 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("polling connection volume = %d, want the gain 37 set on the other connection", got)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -201,7 +303,7 @@ func TestStatusReportsTheProtocolGain(t *testing.T) {
 		t.Fatalf("idle status volume = %d, want the initial gain %d", got, want)
 	}
 
-	if _, err := harness.client.Write(EncodeCommand(CmdSetVolume, 5, EncodeScalar(64))); err != nil {
+	if _, err := harness.client.Write(EncodeCommand(CmdSetVolume, 5, []byte{0, 0, 0, 64})); err != nil {
 		t.Fatalf("write set volume: %v", err)
 	}
 	frame := readCommandFrame(t, harness.client)
@@ -228,43 +330,74 @@ func TestStatusReportsTheProtocolGain(t *testing.T) {
 	}
 }
 
-// TestControlAuthenticatedSessionOutlivesHandshakeTimeout pins the behaviour
-// that broke real casting: once the challenge is answered the phone may keep
-// the session open (and heartbeating) far past the handshake timeout while the
-// user pre-loads playback, and a source-side pause must be acknowledged
-// without tearing the session down.
-func TestControlAuthenticatedSessionOutlivesHandshakeTimeout(t *testing.T) {
-	harness := newControlTestHarness(t, 250*time.Millisecond)
+// TestControlHandshakeDeadlineAppliesUntilOpen pins the reference lifecycle:
+// the handshake deadline covers everything before the source hands over its
+// reverse-WFD endpoint. Authentication alone does not extend it.
+func TestControlHandshakeDeadlineAppliesUntilOpen(t *testing.T) {
+	harness := newControlTestHarnessWithTimeouts(t, 250*time.Millisecond, time.Minute, Hooks{})
 	harness.authenticate(t)
 
 	time.Sleep(3 * 250 * time.Millisecond)
 
-	if _, err := harness.client.Write(EncodeCommand(CmdHeartbeat, 7, nil)); err != nil {
-		t.Fatalf("write heartbeat: %v", err)
-	}
-	frame := readCommandFrame(t, harness.client)
-	if frame.Command != CmdHeartbeatAck || frame.Sequence != 7 {
-		t.Fatalf("reply = %s seq %d, want the heartbeat ack seq 7", frame.Command, frame.Sequence)
+	_ = harness.client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buffer := make([]byte, 1)
+	if _, err := harness.client.Read(buffer); err == nil {
+		t.Fatal("an authenticated session that never sent OPEN must be closed")
 	}
 
-	if _, err := harness.client.Write(EncodeCommand(CmdPause, 8, nil)); err != nil {
-		t.Fatalf("write pause: %v", err)
-	}
-	frame = readCommandFrame(t, harness.client)
-	if frame.Command != CmdPauseAck || frame.Sequence != 8 {
-		t.Fatalf("reply = %s seq %d, want the pause ack seq 8", frame.Command, frame.Sequence)
-	}
-
-	_ = harness.client.Close()
 	harness.wait(t)
 	summary := harness.lastSession(t)
 	if summary == nil {
 		t.Fatal("missing session summary")
 	}
-	if summary.Error == "handshake timed out" {
-		t.Fatalf("authenticated session was cut by the handshake deadline: %+v", summary)
+	if summary.Error != "handshake timed out" {
+		t.Fatalf("summary = %+v, want a handshake timeout", summary)
 	}
-	if !summary.Authenticated || summary.ControlFrames < 2 {
-		t.Fatalf("summary = %+v, want an authenticated session with observed frames", summary)
+	if !summary.Authenticated {
+		t.Fatalf("summary = %+v, want the authentication to be recorded", summary)
 	}
+}
+
+// TestControlEstablishedSessionHasAnIdleWatchdog pins the session-idle
+// contract: an authenticated-but-not-yet-opened session with a long handshake
+// window is still reaped after MiPlaySessionIdleTimeout of complete silence.
+func TestControlEstablishedSessionHasAnIdleWatchdog(t *testing.T) {
+	harness := newControlTestHarnessWithTimeouts(t, 10*time.Second, 200*time.Millisecond, Hooks{})
+	harness.authenticate(t)
+
+	_ = harness.client.SetReadDeadline(time.Now().Add(4 * time.Second))
+	buffer := make([]byte, 1)
+	start := time.Now()
+	if _, err := harness.client.Read(buffer); err == nil {
+		t.Fatal("a silent session must be closed by the idle watchdog")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("idle close took %v", elapsed)
+	}
+
+	harness.wait(t)
+	summary := harness.lastSession(t)
+	if summary == nil || summary.Error != "session idle timeout" {
+		t.Fatalf("summary = %+v, want a session idle timeout", summary)
+	}
+}
+
+// TestControlRepeatedOpenIsAccepted pins the repeated-OPEN behaviour: the
+// sender that already owns the output slot may hand over a new WFD endpoint
+// without a second Claim and without being treated as a concurrent sender.
+func TestControlRepeatedOpenIsAccepted(t *testing.T) {
+	receiver := NewReceiver(config.Default(), discardLogger(), Hooks{})
+	session, err := NewLegacyReceiverSession([]byte(testChallenge), 0, "miplay test", 50,
+		testLocalHost, testLocalPort, testPeerHost, testPeerPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := &sessionRuntime{peer: testPeerHost, startedAt: time.Now().UTC(), session: session}
+	if !receiver.beginSession(report) {
+		t.Fatal("the first OPEN must claim the slot")
+	}
+	if !receiver.beginSession(report) {
+		t.Fatal("a repeated OPEN from the same sender must be accepted")
+	}
+	receiver.endSession(report)
 }

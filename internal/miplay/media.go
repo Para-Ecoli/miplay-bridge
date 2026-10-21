@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/miplay-bridge/miplay-bridge/internal/config"
@@ -29,6 +31,44 @@ const (
 	mpegtsPacketSize     = 188
 	maxTSPacketsPerRTP   = 7
 )
+
+// ALSA output shaping: a large ring with short periods, plus a silence
+// pre-roll. 48kHz stereo S16 is 192000 bytes per second.
+const (
+	alsaPeriodUS = 40_000
+	// alsaStartUS is the playback start threshold. The default (a whole ring,
+	// ~341ms on an ES1371) delays sound after an xrun by the same amount, but
+	// one period reliably triggers a startup xrun on that card; 100ms stays
+	// clean while keeping post-stall recovery short.
+	alsaStartUS        = 100_000
+	alsaBytesPerSecond = 48_000 * 2 * 2
+	// alsaPipeSlack keeps room in the aplay stdin pipe beyond the pre-roll so
+	// an incoming burst can queue before the pump blocks.
+	alsaPipeSlack = 64 * 1024
+	alsaPipeMax   = 1 << 20
+)
+
+// Exported aliases for callers that build test streams or source simulators.
+const (
+	RTPHeaderSize        = rtpHeaderSize
+	RTPPayloadTypeMPEGTS = rtpPayloadTypeMPEGTS
+	MPEGTSPacketSize     = mpegtsPacketSize
+	MaxTSPacketsPerRTP   = maxTSPacketsPerRTP
+)
+
+// PCMReadSize is one 20 ms block of 48 kHz stereo s16le PCM, matching the
+// reference decoder's read size.
+const PCMReadSize = 48_000 * 2 * 2 / 50
+
+// FFmpegLowLatencyInputArgs keeps ffmpeg from spending seconds probing a
+// realtime MPEG-TS stream before the first decoded sample. MiPlay always
+// delivers a validated MPEG-TS/AAC stream, so the reference implementation's
+// small probe is sufficient.
+var FFmpegLowLatencyInputArgs = []string{
+	"-flags", "low_delay",
+	"-probesize", "4096",
+	"-analyzeduration", "0",
+}
 
 // MediaFrameDecoder incrementally splits the media TCP stream into payloads
 // framed as '0x24' + three-byte big-endian length.
@@ -65,6 +105,44 @@ func (d *MediaFrameDecoder) Feed(data []byte) ([][]byte, error) {
 		frames = append(frames, frame)
 	}
 	return frames, nil
+}
+
+// EncodeMediaFrame serialises one wire media frame: '0x24' plus the payload
+// length as a three-byte big-endian integer.
+func EncodeMediaFrame(payload []byte) ([]byte, error) {
+	if len(payload) == 0 || len(payload) > MaxMediaPayload {
+		return nil, protocolErrorf("media payload length out of range")
+	}
+	frame := make([]byte, MediaHeaderSize+len(payload))
+	frame[0] = MediaMagic
+	frame[1] = byte(len(payload) >> 16)
+	frame[2] = byte(len(payload) >> 8)
+	frame[3] = byte(len(payload))
+	copy(frame[MediaHeaderSize:], payload)
+	return frame, nil
+}
+
+// EncodeRTPMPEGTS serialises one RTP packet carrying MPEG-TS. The payload
+// must be a whole number of 188-byte packets, with no more than the captured
+// seven-packet limit.
+func EncodeRTPMPEGTS(sequence uint16, timestamp, ssrc uint32, transportStream []byte, marker bool) ([]byte, error) {
+	if err := validateTransportStream(transportStream); err != nil {
+		return nil, err
+	}
+	if len(transportStream) > mpegtsPacketSize*maxTSPacketsPerRTP {
+		return nil, protocolErrorf("RTP MPEG-TS payload exceeds the captured packet limit")
+	}
+	packet := make([]byte, rtpHeaderSize+len(transportStream))
+	packet[0] = 0x80
+	packet[1] = rtpPayloadTypeMPEGTS
+	if marker {
+		packet[1] |= 0x80
+	}
+	binary.BigEndian.PutUint16(packet[2:4], sequence)
+	binary.BigEndian.PutUint32(packet[4:8], timestamp)
+	binary.BigEndian.PutUint32(packet[8:12], ssrc)
+	copy(packet[rtpHeaderSize:], transportStream)
+	return packet, nil
 }
 
 // RTPPacket is one validated RTP packet carrying MPEG-TS.
@@ -126,6 +204,9 @@ type PipelineStats struct {
 	LastError    string    `json:"last_error,omitempty"`
 	FFmpegAlive  bool      `json:"ffmpeg_alive"`
 	AplayAlive   bool      `json:"aplay_alive"`
+	// Underruns counts the aplay xrun reports of the current pipeline run.
+	// A non-zero value means the ALSA ring drained despite live media.
+	Underruns int64 `json:"underruns"`
 	// Gain is the software gain percentage currently applied between ffmpeg
 	// and aplay. It is independent of the ALSA hardware volume.
 	Gain int `json:"gain"`
@@ -158,10 +239,11 @@ func (r *lineRing) String() string {
 // logPipe forwards a child process stream into the ring buffer and the
 // container log.
 type logPipe struct {
-	ring   *lineRing
-	logger *slog.Logger
-	prefix string
-	buffer []byte
+	ring      *lineRing
+	logger    *slog.Logger
+	prefix    string
+	underruns *atomic.Int64
+	buffer    []byte
 }
 
 func (p *logPipe) Write(data []byte) (int, error) {
@@ -176,6 +258,9 @@ func (p *logPipe) Write(data []byte) (int, error) {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
+		if p.underruns != nil && strings.Contains(strings.ToLower(line), "underrun") {
+			p.underruns.Add(1)
+		}
 		p.ring.add(line)
 		p.logger.Warn(p.prefix, "line", line)
 	}
@@ -189,15 +274,22 @@ func (p *logPipe) Write(data []byte) (int, error) {
 //
 //	media frames -> ffmpeg (MPEG-TS/AAC -> s16le) -> software gain -> aplay (exclusive hw)
 //
-// ffmpeg runs with low-latency input flags; aplay owns an ALSA buffer sized
-// by MIPLAY_ALSA_BUFFER_US, the primary latency knob. The gain stage lives in
-// this process so the protocol volume never touches an ALSA mixer control:
-// the hardware volume remains the console's exclusive domain.
+// ffmpeg runs with low-latency input flags; aplay writes to the exclusive
+// hardware with short periods. MIPLAY_PREBUFFER_US establishes the playback
+// lead (ring plus an enlarged aplay stdin pipe), which is what carries
+// playback across Wi-Fi delivery stalls; MIPLAY_ALSA_BUFFER_US only caps the
+// ALSA ring. The gain stage lives in this process so the protocol volume
+// never touches an ALSA mixer control: the hardware volume remains the
+// console's exclusive domain.
 type Pipeline struct {
 	cfg    config.Config
 	logger *slog.Logger
 
-	mu     sync.Mutex
+	mu sync.Mutex
+	// procMu serialises process generations: Start waits for a previous Stop
+	// to finish draining, so two aplay processes never contend for the
+	// exclusive sound card.
+	procMu sync.Mutex
 	ffmpeg *exec.Cmd
 	aplay  *exec.Cmd
 	stdin  io.WriteCloser
@@ -206,6 +298,11 @@ type Pipeline struct {
 	// decoded PCM chunk. Atomic so a slider move takes effect on the next
 	// chunk without restarting ffmpeg or aplay.
 	gain atomic.Int32
+
+	// underruns counts aplay xrun reports for the current run; the status API
+	// reports it so silence caused by a drained ALSA ring is visible without
+	// scraping container logs.
+	underruns atomic.Int64
 
 	stats    PipelineStats
 	ffmpegEP *lineRing
@@ -275,7 +372,7 @@ func applyGainS16LE(data []byte, percent int) {
 // carried to the next chunk.
 func (p *Pipeline) pump(reader io.Reader, writer io.WriteCloser) {
 	defer writer.Close()
-	buffer := make([]byte, 32*1024)
+	buffer := make([]byte, PCMReadSize)
 	var carry []byte
 	for {
 		read, err := reader.Read(buffer)
@@ -305,31 +402,84 @@ func (p *Pipeline) pump(reader io.Reader, writer io.WriteCloser) {
 	}
 }
 
-// Start launches ffmpeg and aplay. Starting twice is a no-op.
-func (p *Pipeline) Start() error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.ffmpeg != nil {
-		return nil
-	}
-	aplay := exec.Command(p.cfg.AplayPath,
+// aplayArgs builds the raw-PCM output command. The requested buffer is only a
+// ceiling (cards may clamp it); the jitter cushion is the pre-roll held in the
+// enlarged stdin pipe, while the short period keeps wakeups frequent. The
+// start threshold is 100ms: after an xrun aplay otherwise waits until the
+// whole (hardware-clamped) buffer refills before sound resumes.
+func (p *Pipeline) aplayArgs() []string {
+	return []string{
 		"-D", p.cfg.ALSAHardwareDevice(),
 		"-t", "raw",
 		"-f", "S16_LE",
 		"-r", "48000",
 		"-c", "2",
 		"-B", fmt.Sprintf("%d", p.cfg.MiPlayAlsaBufferUS),
+		"-F", fmt.Sprintf("%d", alsaPeriodUS),
+		"-R", fmt.Sprintf("%d", alsaStartUS),
 		"-q",
-	)
-	aplay.Stderr = &logPipe{ring: p.aplayEP, logger: p.logger, prefix: "aplay"}
+	}
+}
 
-	ffmpeg := exec.Command(p.cfg.FFmpegPath,
-		"-hide_banner",
-		"-loglevel", "error",
-		"-f", "mpegts",
-		"-flags", "low_delay",
-		"-probesize", "4096",
-		"-analyzeduration", "0",
+// prebufferBytes is the silence written before the first decoded sample. The
+// pump adds new PCM only as fast as the source delivers it, so this pre-roll
+// is the lead playback draws down during a delivery stall. The ALSA ring
+// cannot hold it on cards that clamp the buffer (an ES1371 stops at 341ms),
+// which is why the rest lives in an enlarged aplay stdin pipe.
+func (p *Pipeline) prebufferBytes() int {
+	return alsaBytesPerSecond * p.cfg.MiPlayPrebufferUS / 1_000_000
+}
+
+// aplayPipeBytes sizes the aplay stdin pipe to hold the whole pre-roll plus
+// slack for one incoming burst. The cap bounds latency creep: at most a pipe
+// full of PCM can queue ahead of playback beyond the pre-roll.
+func (p *Pipeline) aplayPipeBytes() int {
+	size := p.prebufferBytes() + alsaPipeSlack
+	if size > alsaPipeMax {
+		size = alsaPipeMax
+	}
+	return size
+}
+
+// newAplayStdin creates the aplay stdin pipe enlarged beyond the kernel
+// default. The returned capacity is what the kernel granted, which bounds the
+// pre-roll when the resize is refused.
+func newAplayStdin(want int) (*os.File, *os.File, int, error) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	if want > 0 {
+		_, _, _ = syscall.Syscall(syscall.SYS_FCNTL, writer.Fd(), syscall.F_SETPIPE_SZ, uintptr(want))
+	}
+	capacity := 0
+	if value, _, errno := syscall.Syscall(syscall.SYS_FCNTL, writer.Fd(), syscall.F_GETPIPE_SZ, 0); errno == 0 {
+		capacity = int(value)
+	}
+	if capacity <= 0 {
+		capacity = 64 * 1024
+	}
+	return reader, writer, capacity, nil
+}
+
+// Start launches ffmpeg and aplay. Starting twice is a no-op. procMu makes a
+// new generation wait for a previous Stop to finish draining, so it never
+// fights the exclusive sound card.
+func (p *Pipeline) Start() error {
+	p.procMu.Lock()
+	defer p.procMu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ffmpeg != nil {
+		return nil
+	}
+	aplay := exec.Command(p.cfg.AplayPath, p.aplayArgs()...)
+	p.underruns.Store(0)
+	aplay.Stderr = &logPipe{ring: p.aplayEP, logger: p.logger, prefix: "aplay", underruns: &p.underruns}
+
+	ffmpegArgs := []string{"-hide_banner", "-loglevel", "error", "-f", "mpegts"}
+	ffmpegArgs = append(ffmpegArgs, FFmpegLowLatencyInputArgs...)
+	ffmpegArgs = append(ffmpegArgs,
 		"-i", "pipe:0",
 		"-vn",
 		"-acodec", "pcm_s16le",
@@ -338,23 +488,49 @@ func (p *Pipeline) Start() error {
 		"-f", "s16le",
 		"pipe:1",
 	)
+	ffmpeg := exec.Command(p.cfg.FFmpegPath, ffmpegArgs...)
 	ffmpeg.Stderr = &logPipe{ring: p.ffmpegEP, logger: p.logger, prefix: "ffmpeg"}
 
 	decoded, err := ffmpeg.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("open ffmpeg stdout: %w", err)
 	}
-	aplayInput, err := aplay.StdinPipe()
+	aplayRead, aplayInput, pipeCapacity, err := newAplayStdin(p.aplayPipeBytes())
 	if err != nil {
-		return fmt.Errorf("open aplay stdin: %w", err)
+		return fmt.Errorf("create aplay stdin: %w", err)
 	}
+	aplay.Stdin = aplayRead
 	stdin, err := ffmpeg.StdinPipe()
 	if err != nil {
+		_ = aplayRead.Close()
+		_ = aplayInput.Close()
 		return fmt.Errorf("open ffmpeg stdin: %w", err)
 	}
 
 	if err := aplay.Start(); err != nil {
+		_ = aplayRead.Close()
+		_ = aplayInput.Close()
 		return fmt.Errorf("start %s on %s: %w (aplay log: %s)", p.cfg.AplayPath, p.cfg.ALSAHardwareDevice(), err, p.aplayEP.String())
+	}
+	_ = aplayRead.Close()
+	if pipeCapacity < p.aplayPipeBytes() {
+		p.logger.Warn("aplay stdin pipe could not hold the requested prebuffer",
+			"requested_bytes", p.aplayPipeBytes(), "capacity_bytes", pipeCapacity)
+	}
+	// Prefill silence before ffmpeg starts. It primes the ALSA ring and, once
+	// the ring is full, leaves the remainder queued in the enlarged pipe as
+	// the cushion against delivery stalls.
+	prefill := p.prebufferBytes()
+	if prefill > pipeCapacity {
+		prefill = pipeCapacity
+	}
+	if prefill > 0 {
+		if _, err := aplayInput.Write(make([]byte, prefill)); err != nil {
+			_ = aplayInput.Close()
+			_ = aplay.Process.Kill()
+			_, _ = aplay.Process.Wait()
+			return fmt.Errorf("prefill aplay: %w (aplay log: %s)", err, p.aplayEP.String())
+		}
 	}
 	if err := ffmpeg.Start(); err != nil {
 		_ = aplayInput.Close()
@@ -371,6 +547,10 @@ func (p *Pipeline) Start() error {
 	p.logger.Info("miplay realtime pipeline started",
 		"device", p.cfg.ALSAHardwareDevice(),
 		"aplay_buffer_us", p.cfg.MiPlayAlsaBufferUS,
+		"aplay_period_us", alsaPeriodUS,
+		"prebuffer_us", p.cfg.MiPlayPrebufferUS,
+		"prebuffer_bytes", prefill,
+		"aplay_pipe_bytes", pipeCapacity,
 		"software_gain", p.currentGain(),
 		"ffmpeg_pid", ffmpeg.Process.Pid,
 		"aplay_pid", aplay.Process.Pid,
@@ -396,7 +576,11 @@ func (p *Pipeline) Write(transportStream []byte) error {
 
 	if _, err := stdin.Write(transportStream); err != nil {
 		p.mu.Lock()
-		p.stats.LastError = fmt.Sprintf("ffmpeg stdin: %v (ffmpeg log: %s)", err, p.ffmpegEP.String())
+		// A write that loses the race with Stop is teardown noise, not a
+		// playback fault; only report failures of the current generation.
+		if p.ffmpeg == ffmpeg {
+			p.stats.LastError = fmt.Sprintf("ffmpeg stdin: %v (ffmpeg log: %s)", err, p.ffmpegEP.String())
+		}
 		p.mu.Unlock()
 		return fmt.Errorf("write to ffmpeg: %w", err)
 	}
@@ -404,8 +588,12 @@ func (p *Pipeline) Write(transportStream []byte) error {
 }
 
 // Stop releases the pipeline: closing ffmpeg's stdin lets both processes
-// drain and exit; a bounded grace period is followed by SIGKILL.
+// drain and exit; a bounded grace period is followed by SIGKILL. It holds
+// procMu across the waits so a new generation cannot start until the card is
+// free.
 func (p *Pipeline) Stop() {
+	p.procMu.Lock()
+	defer p.procMu.Unlock()
 	p.mu.Lock()
 	ffmpeg := p.ffmpeg
 	aplay := p.aplay
@@ -462,6 +650,7 @@ func (p *Pipeline) Stats() PipelineStats {
 	defer p.mu.Unlock()
 	stats := p.stats
 	stats.Gain = p.currentGain()
+	stats.Underruns = p.underruns.Load()
 	if p.ffmpeg != nil && p.ffmpeg.Process != nil && p.ffmpeg.ProcessState == nil {
 		stats.FFmpegAlive = true
 	}

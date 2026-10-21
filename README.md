@@ -204,12 +204,25 @@ cat /proc/asound/cards
 容器内**不读取 `/proc/asound`**（容器环境中不可见），自检完全走 `/dev/snd` 设备节点探测。
 控制台硬件混音器面板经容器内 `amixer -c ${ALSA_CARD}` 直读直写该声卡控件；妙播与 DLNA 的协议音量不经过 ALSA，只调整各自的软件增益。首次使用前建议在宿主 `alsamixer` 确认无静音陷阱。
 
-### 延迟调节（妙播实时管线）
+### 延迟与抗抖动（妙播实时管线）
 
-妙播链路为低延迟实时播放，主旋钮为 `MIPLAY_ALSA_BUFFER_US`（`aplay` 缓冲，单位微秒，默认 `200000` 即 200ms）：
+妙播链路以 40ms 为 ALSA 周期运行，抗抖动能力由两级缓冲组成：
 
-- 家中 Wi-Fi 拥塞、偶发卡顿：可上调至 `300000~500000` 增强抗抖动；
-- 追求更低延迟（如配合视频）：可下调至 `100000` 左右，但过小可能产生爆音。
+- `MIPLAY_ALSA_BUFFER_US`（默认 `500000`）：向 `aplay` 申请的环形缓冲。声卡可能静默截断（例如 ES1371 上限 16384 帧，约 341ms），因此它只是上限，不能单独决定实际缓冲深度；
+- `MIPLAY_PREBUFFER_US`（默认 `1000000`）：启动时预填的静音，即实际的可听缓冲。环形缓冲装不下的部分放入放大的 `aplay` 管道（最大 1MiB），在 Wi-Fi 成簇到达或短暂停顿时持续供数。
+
+实测（ES1371 + 48kHz 立体声）：仅靠环形缓冲约 400ms 的停顿即会触发 ALSA 欠载并产生可闻静音；1 秒预填可平滑吸收约 1 秒的媒体停顿。
+
+排查静音时对照 `/api/status`：
+
+- `miplay.pipeline.underruns`：声卡缓冲被抽干的次数（aplay 欠载），`aplay` 参数 `-R 40000` 保证欠载恢复只需再积累 40ms 数据，而不是等整个环形缓冲重新填满；
+- `miplay.last_session.media_gaps` / `max_media_gap_ms` / `media_gap_total_ms`：**手机侧**两次投送媒体之间超过 1 秒的停顿统计，日志中对应 `miplay media delivery stalled`；
+- `miplay.last_session.media_write_blocks` / `max_media_write_block_ms`：接收端反压（管道/声卡已满）导致的写入阻塞，正常突发流量下可能有，但应与断流时段错开。
+
+若 `underruns` 与 `media_gaps` 基本对应，且 `max_media_gap_ms` 明显大于预填时长，说明是手机暂停发送（息屏、切歌缓冲、暂停或 Wi-Fi 断流），增大接收端缓冲无法补出手机没有发来的音频；若只有 `media_write_blocks` 而没有 `media_gaps`，才需要下调/调整本机缓冲。
+
+- 家中 Wi-Fi 拥塞、偶发卡顿：保持或上调 `MIPLAY_PREBUFFER_US`（上限 `2500000`）；
+- 追求更低延迟（如配合视频）：下调 `MIPLAY_PREBUFFER_US`（例如 `300000`），代价是抗抖动余量变小。
 
 ---
 
@@ -244,8 +257,10 @@ cat /proc/asound/cards
 | `MIPLAY_CONTROL_PORT` | `8899` | 妙播二进制控制端口 |
 | `MIPLAY_NAME` | `妙播桥` | 手机妙播设备列表显示名 |
 | `MIPLAY_ADVERTISE_ADDRESS` | 自动探测 | 指定对手机广播的 LAN IPv4 |
-| `MIPLAY_HANDSHAKE_TIMEOUT_SECONDS` | `15` | 控制通道鉴权超时 |
-| `MIPLAY_ALSA_BUFFER_US` | `200000` | `aplay` 缓冲（微秒），延迟主旋钮 |
+| `MIPLAY_HANDSHAKE_TIMEOUT_SECONDS` | `15` | 手机交出反向 WFD 端点前的握手超时 |
+| `MIPLAY_SESSION_IDLE_TIMEOUT_SECONDS` | `180` | 已建立会话在既无控制帧也无媒体包时的空闲回收时间；`0` 关闭 |
+| `MIPLAY_ALSA_BUFFER_US` | `500000` | `aplay` 环形缓冲请求（微秒），受声卡上限截断 |
+| `MIPLAY_PREBUFFER_US` | `1000000` | 启动预填静音（微秒），实际抗抖动缓冲与启动延迟 |
 | `FFMPEG_PATH` / `APLAY_PATH` | `ffmpeg` / `aplay` | 实时管线二进制路径 |
 | `DLNA_ENABLED` | `true` | DLNA 渲染器总开关 |
 | `DLNA_FRIENDLY_NAME` | `妙播桥` | DLNA 设备显示名 |
@@ -282,7 +297,7 @@ cat /proc/asound/cards
 
 **Q5：妙播播放正常但延迟偏高 / 偶发卡顿？**
 
-调节 `MIPLAY_ALSA_BUFFER_US`（见上文「延迟调节」）。
+延迟偏高时下调 `MIPLAY_PREBUFFER_US`；偶发卡顿先查看 `/api/status` 的 `miplay.pipeline.underruns` 是否增长，再适当上调 `MIPLAY_PREBUFFER_US`（见上文「延迟与抗抖动」）。
 
 **Q6：容器启动失败，如何判断原因？**
 

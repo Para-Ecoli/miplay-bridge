@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"io"
 	"log/slog"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/miplay-bridge/miplay-bridge/internal/config"
@@ -120,6 +122,114 @@ func TestDecodeRTPMPEGTSRejectsCorruption(t *testing.T) {
 
 	if _, err := DecodeRTPMPEGTS(make([]byte, 100)); err == nil {
 		t.Fatal("a truncated RTP packet must be rejected")
+	}
+}
+
+func TestFFmpegPipelineUsesTheReferenceLowLatencyProfile(t *testing.T) {
+	want := []string{"-flags", "low_delay", "-probesize", "4096", "-analyzeduration", "0"}
+	if len(FFmpegLowLatencyInputArgs) != len(want) {
+		t.Fatalf("args = %v", FFmpegLowLatencyInputArgs)
+	}
+	for index := range want {
+		if FFmpegLowLatencyInputArgs[index] != want[index] {
+			t.Fatalf("args = %v, want %v", FFmpegLowLatencyInputArgs, want)
+		}
+	}
+	if PCMReadSize != 3840 {
+		t.Fatalf("PCMReadSize = %d, want 3840", PCMReadSize)
+	}
+}
+
+func TestAlsaOutputUsesTheJitterBufferingProfile(t *testing.T) {
+	if alsaPeriodUS != 40_000 {
+		t.Fatalf("alsaPeriodUS = %d, want 40000", alsaPeriodUS)
+	}
+	if alsaStartUS != 100_000 {
+		t.Fatalf("alsaStartUS = %d, want 100000: one period xruns on the ES1371 at start, the full ring delays recovery", alsaStartUS)
+	}
+	cfg := config.Default()
+	if got := cfg.MiPlayAlsaBufferUS; got != 500_000 {
+		t.Fatalf("default aplay buffer = %d, want 500000", got)
+	}
+	if got := cfg.MiPlayPrebufferUS; got != 1_000_000 {
+		t.Fatalf("default prebuffer = %d, want 1000000", got)
+	}
+	pipeline := NewPipeline(cfg, discardLogger())
+	if got := pipeline.prebufferBytes(); got != 192_000 {
+		t.Fatalf("prebuffer bytes = %d, want 192000 (1s of 48kHz stereo S16)", got)
+	}
+	if pipe := pipeline.aplayPipeBytes(); pipe < pipeline.prebufferBytes()+alsaPipeSlack {
+		t.Fatalf("aplay pipe = %d bytes, want room for the prebuffer plus slack", pipe)
+	}
+	args := strings.Join(pipeline.aplayArgs(), " ")
+	if !strings.Contains(args, "-B 500000") || !strings.Contains(args, "-F 40000") {
+		t.Fatalf("aplay args = %s, want a 500ms buffer and 40ms periods", args)
+	}
+	if !strings.Contains(args, "-R 100000") {
+		t.Fatalf("aplay args = %s, want a 100ms start threshold so xrun recovery starts promptly", args)
+	}
+}
+
+func TestAplayPipeIsBounded(t *testing.T) {
+	cfg := config.Default()
+	cfg.MiPlayPrebufferUS = 10_000_000
+	pipeline := NewPipeline(cfg, discardLogger())
+	if got := pipeline.aplayPipeBytes(); got != alsaPipeMax {
+		t.Fatalf("aplay pipe = %d, want the %d-byte cap", got, alsaPipeMax)
+	}
+}
+
+func TestLogPipeCountsAplayUnderruns(t *testing.T) {
+	var underruns atomic.Int64
+	pipe := &logPipe{ring: newLineRing(4), logger: discardLogger(), prefix: "aplay", underruns: &underruns}
+	if _, err := pipe.Write([]byte("underrun!!! (at least 82.349 ms long)\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pipe.Write([]byte("some other diagnostic\n")); err != nil {
+		t.Fatal(err)
+	}
+	if got := underruns.Load(); got != 1 {
+		t.Fatalf("underruns = %d, want 1", got)
+	}
+}
+
+func TestMediaEncodersMatchTheWireContract(t *testing.T) {
+	transportStream := buildTransportStream(2)
+	rtp, err := EncodeRTPMPEGTS(7, 1920, 0xDEADBEEF, transportStream, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, err := DecodeRTPMPEGTS(rtp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if packet.Sequence != 7 || packet.Timestamp != 1920 || packet.SSRC != 0xDEADBEEF || !packet.Marker {
+		t.Fatalf("packet = %+v", packet)
+	}
+	if !bytes.Equal(packet.TransportStream, transportStream) {
+		t.Fatal("transport stream mismatch")
+	}
+
+	frame, err := EncodeMediaFrame(rtp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frame[0] != MediaMagic || int(frame[1])<<16|int(frame[2])<<8|int(frame[3]) != len(rtp) {
+		t.Fatalf("frame header = % x", frame[:4])
+	}
+	frames, err := NewMediaFrameDecoder().Feed(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frames) != 1 || !bytes.Equal(frames[0], rtp) {
+		t.Fatalf("frames = %d", len(frames))
+	}
+
+	if _, err := EncodeMediaFrame(nil); err == nil {
+		t.Fatal("an empty media frame must be rejected")
+	}
+	if _, err := EncodeRTPMPEGTS(0, 0, 0, buildTransportStream(MaxTSPacketsPerRTP+1), false); err == nil {
+		t.Fatal("more than seven TS packets per RTP must be rejected")
 	}
 }
 

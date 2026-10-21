@@ -80,13 +80,22 @@ type Config struct {
 	// MiPlayAdvertiseAddress overrides the LAN IPv4 used in mDNS answers and
 	// in the Safety channel key derivation. Empty means auto-detect.
 	MiPlayAdvertiseAddress string
-	// MiPlayHandshakeTimeout bounds the control-channel authentication phase;
-	// a phone that stalls mid-handshake must not hold the slot forever.
+	// MiPlayHandshakeTimeout bounds the control-channel window before the
+	// source hands over its WFD endpoint; a phone that stalls mid-handshake
+	// must not hold the slot forever.
 	MiPlayHandshakeTimeout time.Duration
-	// MiPlayAlsaBufferUS is the aplay buffer time in microseconds, the primary
-	// latency knob of the realtime pipeline. 200ms absorbs Wi-Fi jitter while
-	// staying interactive.
+	// MiPlaySessionIdleTimeout closes an established session after this long
+	// without any control frame or media packet. Zero disables the watchdog.
+	MiPlaySessionIdleTimeout time.Duration
+	// MiPlayAlsaBufferUS is the aplay ring-buffer time in microseconds. Old
+	// cards silently clamp it (an ES1371 stops at 16384 frames, 341ms at
+	// 48kHz stereo), so it is a ceiling rather than the real cushion.
 	MiPlayAlsaBufferUS int
+	// MiPlayPrebufferUS is the silence pre-roll written before the first
+	// decoded sample. It lives in the ALSA ring plus an enlarged aplay stdin
+	// pipe, so it is the steady-state cushion that keeps playback alive
+	// across Wi-Fi delivery stalls; it is also the extra startup latency.
+	MiPlayPrebufferUS int
 	// FFmpegPath is the MPEG-TS/AAC decoder binary of the realtime pipeline.
 	FFmpegPath string
 	// AplayPath is the raw-PCM ALSA output binary of the realtime pipeline.
@@ -137,13 +146,15 @@ func Default() Config {
 		MPDStartTimeout:   20 * time.Second,
 		MPDMaxRestarts:    5,
 
-		MiPlayEnabled:          true,
-		MiPlayControlPort:      8899,
-		MiPlayName:             "妙播桥",
-		MiPlayHandshakeTimeout: 15 * time.Second,
-		MiPlayAlsaBufferUS:     200000,
-		FFmpegPath:             "ffmpeg",
-		AplayPath:              "aplay",
+		MiPlayEnabled:            true,
+		MiPlayControlPort:        8899,
+		MiPlayName:               "妙播桥",
+		MiPlayHandshakeTimeout:   15 * time.Second,
+		MiPlaySessionIdleTimeout: 180 * time.Second,
+		MiPlayAlsaBufferUS:       500000,
+		MiPlayPrebufferUS:        1000000,
+		FFmpegPath:               "ffmpeg",
+		AplayPath:                "aplay",
 
 		DLNAEnabled:      true,
 		DLNAFriendlyName: "妙播桥",
@@ -230,7 +241,13 @@ func Load() (Config, error) {
 	if err := parseSecondsEnv("MIPLAY_HANDSHAKE_TIMEOUT_SECONDS", &cfg.MiPlayHandshakeTimeout, 1, 120); err != nil {
 		return cfg, err
 	}
+	if err := parseSecondsEnv("MIPLAY_SESSION_IDLE_TIMEOUT_SECONDS", &cfg.MiPlaySessionIdleTimeout, 0, 86400); err != nil {
+		return cfg, err
+	}
 	if err := parseIntEnv("MIPLAY_ALSA_BUFFER_US", &cfg.MiPlayAlsaBufferUS, 10000, 2000000); err != nil {
+		return cfg, err
+	}
+	if err := parseIntEnv("MIPLAY_PREBUFFER_US", &cfg.MiPlayPrebufferUS, 0, 2500000); err != nil {
 		return cfg, err
 	}
 	if v := strings.TrimSpace(os.Getenv("FFMPEG_PATH")); v != "" {

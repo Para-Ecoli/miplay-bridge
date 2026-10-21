@@ -42,6 +42,48 @@ func TestIdentityAppsDataFixedVector(t *testing.T) {
 	}
 }
 
+func TestDecodeAppsDataRoundTrip(t *testing.T) {
+	identity := testIdentity()
+	encoded, err := identity.AppsData()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := DecodeAppsData(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binary.BigEndian.Uint16(payload[2:4]) != 8899 {
+		t.Fatalf("control port = %d", binary.BigEndian.Uint16(payload[2:4]))
+	}
+	if !strings.Contains(string(payload[25:]), identity.canonicalUUID()) {
+		t.Fatalf("payload = %s", payload[25:])
+	}
+	if _, err := DecodeAppsData("!!!"); err == nil {
+		t.Fatal("invalid base64 must be rejected")
+	}
+	container, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeAppsData(base64.StdEncoding.EncodeToString(container[:len(container)-1])); err == nil {
+		t.Fatal("a container whose length does not match must be rejected")
+	}
+}
+
+func TestIdentityLabelsCarryAStableDeviceSuffix(t *testing.T) {
+	deviceID := []byte{0xAA, 0xBB, 0xCC, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D}
+	instance, host := identityLabels("妙播桥", deviceID)
+	if instance != "MiplayBridge-aabbcc" {
+		t.Fatalf("instance = %q", instance)
+	}
+	if host != "miplaybridge-aabbcc" {
+		t.Fatalf("host = %q", host)
+	}
+	if len(instance) > 63 || len(host) > 63 {
+		t.Fatalf("labels must fit a DNS label: %q / %q", instance, host)
+	}
+}
+
 func TestIdentityAppsDataStructure(t *testing.T) {
 	encoded, err := testIdentity().AppsData()
 	if err != nil {
